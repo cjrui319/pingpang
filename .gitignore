@@ -1,35 +1,55 @@
-# ===== 自测产物 / 缓存 =====
+# ============================================================
+# 大文件资产一律不进 Git
+# GitHub 单文件硬上限 100MB（超 50MB 告警），本目录下多为 GB 级
+# 比赛素材且可重新下载。队友/新机器请从官方资料重新获取，
+# 不要用 git add -f 强行加入（进历史后极难清理）。
+# ============================================================
+
+# --- competition release archives (local keep only) ---
+# pp_train_data.zip  ~680MB   乒乓球训练集
+# bb_train_data.zip  ~4.9GB   篮球训练集
+# sport-base_v1.tar  ~23.8GB  基础镜像，仅"方式二 本地Docker提交"需要
+# no leading slash on purpose: a leading slash would anchor to repo root,
+# but these archives live in the pppp/ subdirectory.
+*_train_data.zip
+pp_train_data.zip
+bb_train_data.zip
+sport-base*.tar
+pp_train_data/
+bb_train_data/
+
+# --- public validation videos (218MB, fetch separately) ---
+participant/*/public_data/videos/
+participant/*/public_data/**/*.mp4
+
+# --- duplicated nested extraction (restore from participant.zip) ---
+participant/participant/
+
+# --- self-test output / caches ---
 __pycache__/
 *.py[cod]
 *.egg-info/
 .pytest_cache/
 .ipynb_checkpoints/
-
-# 自测输出（run.py --output 的落点，别提交）
 out/
 out_check_solution/
 trt_cache/
 *.engine
 *.plan
 
-# ===== 大文件资产：不进 Git =====
-# 公开验证集：篮球 165MB + 乒乓球视频，超过 GitHub 单文件 100MB 硬限制，
-# 且属于可再获取的比赛素材，不进仓库；队友/新机器另从比赛资料拷回。
-participant/*/public_data/videos/
-participant/*/public_data/**/*.mp4
-
-# 自定义训练的权重：由实验产物，不进 Git（内置参考权重仍在版本控制里，
-# 想改这条策略就删掉下面两行，改用 Git LFS）
+# --- trained weights are experiment artifacts, not source ---
+# built-in reference weights stay tracked (ball.onnx / player.onnx)
 participant/*/participant/weights/*.pth
 participant/*/participant/weights/*.pt
+participant/*/participant/weights/*.engine
 participant/*/participant/models/*.onnx
 
-# 打包提交物
+# --- packaged submissions (docker save output) ---
 *.tar
 *.tar.gz
-sport-base*.tar
+*.tgz
 
-# ===== 编辑器 / 系统 =====
+# --- editors / OS ---
 .vscode/
 .idea/
 .DS_Store
