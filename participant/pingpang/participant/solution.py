@@ -37,9 +37,10 @@ from .base_solution import BaseSolution
 from . import pp_fast
 from .pp_fast import FrameTiler, RefTrt
 
-# 落点判定的唯一实现在 emit_rule.py（7 个参数）：调参工具 _tune_eval.py 与等价性测试
-# _check_emit_equiv.py 都 import 它，确保「扫出来的参数」与「线上跑的判定」是同一份代码。
-# 默认值 = 参考实现原值（peak_win=1 / peak_conf=0 / smooth=0 即完全等价关闭）；
+# 落点判定的唯一实现在 emit_rule.py（7 个参数）：调参工具 tune_eval.py（在仓库根，
+# 刻意放在 participant/ 之外——它读 gt_public.jsonl 真值，不应打进提交镜像）
+# 与等价性测试 _check_emit_equiv.py 都 import 它，确保「扫出来的参数」与「线上跑的判定」
+# 是同一份代码。默认值 = 参考实现原值（peak_win=1 / peak_conf=0 / smooth=0 即完全等价关闭）；
 # 可用 PP_MIN_GAP/PP_CONF_TH/PP_FALL_AMP/PP_RISE_AMP/PP_PEAK_WIN/PP_PEAK_CONF/PP_SMOOTH
 # 做 A/B（不设则行为不变）。实测结论见 emit_rule.py 文件头。
 from .emit_rule import EmitRule, describe as describe_params  # noqa: E402

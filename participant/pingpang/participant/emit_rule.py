@@ -1,7 +1,8 @@
 """落点判定规则：球心 y 的局部极大 + 下落/反弹幅度门控（纯 Python，不依赖 cv2/numpy 之外的东西）。
 
 为什么单独成模块（而不是留在 solution.py 里）：
-    **调参与提交必须共用同一份实现。** 离线扫参工具 `_tune_eval.py`、等价性测试
+    **调参与提交必须共用同一份实现。** 离线扫参工具 `tune_eval.py`（在**仓库根**，刻意
+    放在 participant/ 之外：它会读 gt_public.jsonl 真值，不应打进提交镜像）、等价性测试
     `_check_emit_equiv.py`、正式提交 `solution.py` 全部 import 这里的 `EmitRule`；
     否则「扫出来的最优参数」和「线上真正跑的判定逻辑」会各自漂移——典型事故是
     测试全绿但线上参数根本没生效。
@@ -13,7 +14,7 @@
     * 帧对齐：ch1 解码的是 3 帧栈的中间帧（滞后 1），上报 max(0, fid-1)；
     * 尾部：视频结束时允许只依赖 1 个未来点（need_future=1）再判一次，避免丢末尾落点。
 
-实测结论（public_data 15 条视频 2109 帧；用 participant/_tune_eval.py 本地复现）：
+实测结论（public_data 15 条视频 2109 帧；用仓库根的 tune_eval.py 本地复现）：
     基线 min_gap=10 conf_th=0.75 fall_amp=2.0 rise_amp=1.0 → 折分 45.00/75
     （0° TP10/FP16→F1 0.426、45° 28/18→0.667、90° 23/9→0.708）。
     **失分主要在精度（FP）而非漏检**。7 个方向逐一实测，参考实现原值全部是局部最优，
@@ -27,7 +28,7 @@
         抹掉要判的那个尖峰）。
     结论：这组启发式参数已到局部最优，继续提分要靠更好的检测/跟踪（模型侧），而不是在这
     7 个阈值上继续拧。任何改动前请先用
-    `python3 participant/_tune_eval.py score --traj <dump 目录> --one-way --per-video` 复测。
+    `python3 tune_eval.py score --traj <dump 目录> --input participant/pingpang/public_data --one-way --per-video` 复测。
 
 参数默认值 = 官方参考实现原值；同时支持用环境变量覆盖，**只为 A/B 测量**（不设变量时行为与
 参考实现完全一致）。若将来在评测机的 TRT 轨迹上确证某组参数更优，把数值写死在 DEFAULT_*。
@@ -44,24 +45,35 @@ __all__ = ["EmitRule", "PARAMS", "PARAM_NAMES", "params_from_env", "describe",
            "MIN_GAP", "CONF_TH", "FALL_AMP", "RISE_AMP"]
 
 
-def _env_int(name: str, default: int) -> int:
+def _env_int(name: str, default: int, lo: int, hi: int) -> int:
+    """读整型环境变量；**越界或非法一律回退默认值**。
+
+    带边界检查是必须的：这些变量只是为了本地 A/B，但线上环境万一存在同名变量，
+    无边界会让它变成隐患——实测 `PP_PEAK_WIN=-1` 曾被直接接受，
+    `PP_SMOOTH=1e9` 会让"时域平滑"退化成 O(n²) 扫描。
+    """
     raw = (os.environ.get(name) or "").strip()
     if not raw:
         return default
     try:
-        return int(float(raw))
+        v = int(float(raw))
     except ValueError:
         return default
+    return v if lo <= v <= hi else default
 
 
-def _env_float(name: str, default: float) -> float:
+def _env_float(name: str, default: float, lo: float, hi: float) -> float:
+    """读浮点环境变量；越界或非法一律回退默认值。NaN/Inf 也被挡掉。"""
     raw = (os.environ.get(name) or "").strip()
     if not raw:
         return default
     try:
-        return float(raw)
+        v = float(raw)
     except ValueError:
         return default
+    if not (v == v and v not in (float("inf"), float("-inf"))):   # NaN / Inf
+        return default
+    return v if lo <= v <= hi else default
 
 
 DEFAULT_MIN_GAP = 10     # 两次落点最小帧间隔
@@ -77,27 +89,29 @@ DEFAULT_SMOOTH = 0       # 判定用的 y 时域平滑半窗（0 = 不平滑，�
 MIN_GAP, CONF_TH, FALL_AMP, RISE_AMP = (DEFAULT_MIN_GAP, DEFAULT_CONF_TH,
                                         DEFAULT_FALL_AMP, DEFAULT_RISE_AMP)
 
-# 环境变量名 → (默认值)。A/B 时用 PP_MIN_GAP=6 之类即可，无需改代码。
+# 环境变量名 → (默认值, 下界, 上界)。A/B 时用 PP_MIN_GAP=6 之类即可，无需改代码。
+# 上界刻意收紧：这些值只是本地 A/B 用的旋钮，一旦被外部环境的同名变量意外设成
+# 极端值，必须在读入时就退回默认，而不是让它影响线上行为或把 O(n) 变成 O(n²)。
 PARAMS = {
-    "min_gap": ("PP_MIN_GAP", DEFAULT_MIN_GAP),
-    "conf_th": ("PP_CONF_TH", DEFAULT_CONF_TH),
-    "fall_amp": ("PP_FALL_AMP", DEFAULT_FALL_AMP),
-    "rise_amp": ("PP_RISE_AMP", DEFAULT_RISE_AMP),
-    "peak_win": ("PP_PEAK_WIN", DEFAULT_PEAK_WIN),
-    "peak_conf": ("PP_PEAK_CONF", DEFAULT_PEAK_CONF),
-    "smooth": ("PP_SMOOTH", DEFAULT_SMOOTH),
+    "min_gap":   ("PP_MIN_GAP",   DEFAULT_MIN_GAP,   1,   10_000),
+    "conf_th":   ("PP_CONF_TH",   DEFAULT_CONF_TH,   0.0, 1.0),
+    "fall_amp":  ("PP_FALL_AMP",  DEFAULT_FALL_AMP,  0.0, 10_000.0),
+    "rise_amp":  ("PP_RISE_AMP",  DEFAULT_RISE_AMP,  0.0, 10_000.0),
+    "peak_win":  ("PP_PEAK_WIN",  DEFAULT_PEAK_WIN,  1,   64),
+    "peak_conf": ("PP_PEAK_CONF", DEFAULT_PEAK_CONF, 0.0, 1.0),
+    "smooth":    ("PP_SMOOTH",    DEFAULT_SMOOTH,    0,   64),
 }
 PARAM_NAMES = tuple(PARAMS)
 
 
 def params_from_env() -> dict:
-    """当前生效的参数（含环境变量覆盖）。"""
+    """当前生效的参数（含环境变量覆盖；越界/非法值一律回退默认）。"""
     out = {}
-    for name, (env, default) in PARAMS.items():
+    for name, (env, default, lo, hi) in PARAMS.items():
         if isinstance(default, int):
-            out[name] = _env_int(env, default)
+            out[name] = _env_int(env, default, lo, hi)
         else:
-            out[name] = _env_float(env, default)
+            out[name] = _env_float(env, default, lo, hi)
     return out
 
 
@@ -114,9 +128,11 @@ def describe(params: Optional[dict] = None) -> str:
 class EmitRule:
     """轨迹流式喂入 → 滚出落点。状态：traj / last_emit / 两个增量游标。
 
-    增量游标（相对参考实现「每帧全量重扫」的等价改写，已由 648 组用例验证）：
-    游标只前进不回退；被门控挡掉的 j 之后只会更被挡掉，局部极大只依赖 j±1，
+    增量游标（相对参考实现「每帧全量重扫」的等价改写）：游标只前进不回退；
+    被门控挡掉的 j 之后只会更被挡掉，局部极大只依赖 j±1，
     故已扫描过的 j 不会改变结论，总复杂度 O(n)。
+    等价性由 `_check_emit_equiv.py` 逐组差分验证（**组数以该脚本实际打印为准**，
+    不要在这里写死数字——它曾因用例扩充而产生过不一致）。
     """
 
     __slots__ = ("min_gap", "conf_th", "fall_amp", "rise_amp",

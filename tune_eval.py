@@ -1,4 +1,8 @@
-"""离线精度调参工具（**开发用，提交前可整文件删除**）。
+"""离线精度调参工具（**开发用，不属于提交产物**）。
+
+本文件在**仓库根**。刻意放在 `participant/` 之外：它会读 `gt_public.jsonl` 真值，
+而 `participant/` 整个目录会被打进提交镜像——一个"容器里放着读真值代码"的作品
+在评审眼里是高风险项。提交镜像里只需要 `solution.py` / `emit_rule.py` / `pp_fast.py`。
 
 要解决的问题：精度分 75 分，而 0° 视角只有 21 个有效 GT，每错一个点就动 ~4% F1；
 没有可测量的回路就只能盲调，极易把噪声当信号。本工具给出**官方口径**的本地评分：
@@ -10,22 +14,27 @@
       * P = TP/(TP+FP)，R = TP/(TP+FN)，F1 = 2PR/(P+R)
       * 精度分 = 25*F1_0° + 25*F1_45° + 25*F1_90°
 
-三个子命令：
+四个子命令：
   1) dump   —— 在能跑模型的环境里把公开集跑一遍，逐帧检测结果落盘（只跑一次）
-       python3 participant/_tune_eval.py dump --input public_data --out /tmp/pp_traj
+       python3 tune_eval.py dump --input participant/pingpang/public_data --out /tmp/pp_traj
      评测机路径（TRT + NVDEC）就是上面的默认值。**没有 TRT/GPU 的开发机也能测**：
-       python3 participant/_tune_eval.py dump --input public_data --out /tmp/pp_traj \
-           --backend ort --decoder cpu --ort-dir <解包后的 onnxruntime 目录>
+       python3 tune_eval.py dump --input participant/pingpang/public_data --out /tmp/pp_traj \
+           --backend ort --decoder cv2
        （--decoder cv2 是本机既无 PyAV 也无 ffmpeg 时的兜底；ORT 与 TRT fp16 的数值
          有极小差异，故 ORT 上只用于**横向比较参数**，绝对值以评测机为准）
   2) score  —— 纯离线：重放 EmitRule + 官方口径评分 + 参数扫描（不需要模型/GPU）
-       python3 participant/_tune_eval.py score --traj /tmp/pp_traj --input public_data \
-           --one-way --per-video
-  3) selftest —— 不需要模型：用 GT 合成「理想检测器」轨迹，验证评分器，并直接算出
+       python3 tune_eval.py score --traj /tmp/pp_traj \
+           --input participant/pingpang/public_data --one-way --per-video --detail
+  3) align  —— 帧对齐校准分析：Δframe 分布 + 失效来源分解
+       python3 tune_eval.py align --traj /tmp/pp_traj \
+           --input participant/pingpang/public_data
+       ⚠️ 它的"候选峰"是**诊断口径**（conf>=0.75、不带 MIN_GAP），
+          与 score 输出的 TP/FP 不可互相推导，两者要分开看。
+  4) selftest —— 不需要模型：用 GT 合成「理想检测器」轨迹，验证评分器，并直接算出
        MIN_GAP 过紧会丢多少真实落点（给出 0°/45°/90° 的 F1 天花板）
 
-设计原则：落点判定只有一份实现（participant/emit_rule.py）。本工具 import 它，
-所以「扫出来的参数」与「线上真正跑的判定」不可能对不上。
+设计原则：落点判定只有一份实现（participant/pingpang/participant/emit_rule.py）。
+本工具 import 它，所以「扫出来的参数」与「线上真正跑的判定」不可能对不上。
 
 评分器的一处不可避免的假设：官方是「一对一匹配」，但未公开具体匹配算法（贪心/匈牙利）。
 本工具按「距离升序贪心」匹配；该假设对所有候选参数完全一致，故 A/B 结论不受影响。
@@ -831,7 +840,7 @@ def cmd_dump(a) -> int:
         "n_videos": len(ids), "params_for_replay": params_from_env(),
     }, ensure_ascii=False, indent=1), encoding="utf-8")
     print(f"[dump] 完成。离线扫参：\n"
-          f"  python participant/_tune_eval.py score --traj {out_dir} --input {a.input} --sweep")
+          f"  python tune_eval.py score --traj {out_dir} --input {a.input} --sweep")
     return 0
 
 
