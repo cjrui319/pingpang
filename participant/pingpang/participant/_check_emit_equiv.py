@@ -10,6 +10,10 @@
 
 为什么必须 import 真实现：早先这个测试自己复制了一份判定代码，后果是——改了
 solution.py 的参数，测试照样全绿。现在参数也从 emit_rule 取，测试才真的在保护它。
+
+关于环境变量：本测试会**先清空所有 PP_ 前缀的环境变量**，再读参数，
+强制按默认参数比较。理由是这个测试要证明的是「默认参数下与参考实现逐字等价」，
+若允许 PP_* 覆盖，参考侧的基准也会跟着变，测试就失去意义了。
 """
 from __future__ import annotations
 
@@ -30,19 +34,28 @@ for _s in (sys.stdout, sys.stderr):
     except (AttributeError, ValueError):
         pass
 
+import os
+
+# 任何 PP_* 环境变量都会改变"参考语义"的比较基准，让这个测试失去意义
+# （它要证明的是「默认参数下与参考实现逐字等价」）。
+# 本测试**强制按默认参数**运行：先清掉 PP_*，再读参数。
+_CLEARED = {k: os.environ.pop(k) for k in list(os.environ) if k.startswith("PP_")}
+
 from participant.emit_rule import EmitRule, describe, params_from_env  # noqa: E402
 
-P = params_from_env()                # 真实现当前生效的参数（PP_* 环境变量可覆盖）
+P = params_from_env()                # 现在必然等于 DEFAULT_*（PP_* 已清空）
 MIN_GAP, CONF_TH, FALL_AMP, RISE_AMP = (P["min_gap"], P["conf_th"],
                                         P["fall_amp"], P["rise_amp"])
 
 # peak_win / peak_conf 是「默认关闭的加强判据」，官方参考实现里没有对应物——
-# 本测试只证明「默认关闭状态下逐字等价」，故这里强制按关闭态比较并给出提示。
-_PEAK_OVERRIDE = bool(P["peak_win"] != 1 or P["peak_conf"] != 0.0)
+# 本测试只证明「默认关闭状态下逐字等价」，故这里强制按关闭态比较。
+_DEV = {"peak_win": P["peak_win"], "peak_conf": P["peak_conf"], "smooth": P["smooth"]}
 print(f"参数: {describe(P)}")
-if _PEAK_OVERRIDE:
-    print("  注意：PP_PEAK_WIN/PP_PEAK_CONF 被设成了非默认值——参考实现无对应判据，"
-          "本测试强制按 peak_win=1 / peak_conf=0（关闭态）比较。")
+if _CLEARED:
+    print(f"  已清空环境变量 {sorted(_CLEARED)}：本测试只验证默认参数（清空前 {_CLEARED}）")
+if _DEV["peak_win"] != 1 or _DEV["peak_conf"] != 0.0 or _DEV["smooth"] != 0:
+    print(f"  ⚠️ 非默认的加强判据生效中 {_DEV}——参考实现无对应物，"
+          "本测试只覆盖默认关闭态的等价性。")
 
 
 # ── 参考：每帧全量重扫 ──────────────────────────────────────────────────────

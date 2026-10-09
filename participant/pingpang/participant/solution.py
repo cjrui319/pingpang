@@ -45,7 +45,29 @@ from .pp_fast import FrameTiler, RefTrt
 # 做 A/B（不设则行为不变）。实测结论见 emit_rule.py 文件头。
 from .emit_rule import EmitRule, describe as describe_params  # noqa: E402
 
-PROFILE = os.environ.get("PP_PROFILE", "1").strip() != "0"
+def _env_flag(name: str, default: bool = False) -> bool:
+    """严格解析布尔型环境变量，返回 True/False。
+
+    三态语义（这是关键）：
+      * 未设置 / 空      -> 用调用方给的 default
+      * 明确的真假值     -> 按它
+      * **无法识别的值** -> 一律 False（安全基线），不沿用 default
+    刻意不用 `os.environ.get(x, "1") != "0"` 那种写法——那样任何未识别值
+    （yes / garbage / 2 …）都会把开关打开。本开关控制耗时画像：每帧多 4 次
+    clock 调用 + 每视频一行 run.log 写入，线上不该被意外打开。
+    与 emit_rule.py 的 PP_* 参数保持同一原则：意外值一律落到安全基线。
+    """
+    raw = (os.environ.get(name) or "").strip().lower()
+    if raw in ("1", "true", "yes", "on"):
+        return True
+    if raw in ("0", "false", "no", "off"):
+        return False
+    if raw == "":
+        return default            # 未设置/空 -> 用调用方的默认
+    return False                  # 兜底：无法识别 -> 安全基线（关闭）
+
+
+PROFILE = _env_flag("PP_PROFILE", default=True)   # 默认开（诊断用）；显式设 0 关闭
 
 
 def _trt_cache_dir(output_dir) -> Path:
