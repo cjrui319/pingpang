@@ -1,0 +1,41 @@
+# ============================================================
+# 关键：本工程带字节级完整性校验（*/.integrity.json 存的是
+# SHA256），任何行尾被改成 CRLF 都会导致校验失败 = 无成绩。
+# Git for Windows 默认 core.autocrlf=true，务必按下面配置。
+# ============================================================
+
+# 1) 被 integrity.json 保护的文件：完全不做行尾转换，字节原样
+#    （.py/.sh/.json 全部按二进制处理，只防"被改写"，不影响 diff）
+* -text
+
+# 2) 需要给人看的文本，显式声明用 LF（即使以后加 -text 例外也不跑偏）
+*.py   text eol=lf
+*.sh   text eol=lf
+*.md   text eol=lf
+*.json text eol=lf
+*.jsonl text eol=lf
+
+# 3) 真正的二进制资产，禁止 diff / 禁止合并
+*.onnx binary
+*.engine binary
+*.trt binary
+*.plan binary
+*.pt binary
+*.pth binary
+*.ckpt binary
+*.mp4 binary
+*.avi binary
+*.mov binary
+*.mkv binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+
+# 4) 压缩包与镜像
+*.zip binary
+*.tar binary
+*.tar.gz binary
+*.whl binary
+
+# 5) 让 .sh 在 GitHub 上被识别，也提醒自己提交时要带 exec 位
+*.sh linguist-language=Shell

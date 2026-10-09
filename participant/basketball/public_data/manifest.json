@@ -1,0 +1,32 @@
+{
+ "name": "basketball-player-tracking",
+ "created": "2026-08-31",
+ "counts": {
+  "videos": 2,
+  "games": 1,
+  "boxes": 10296,
+  "tracks": 21
+ },
+ "videos": [
+  {
+   "video_id": "魔术vs凯尔特人_seg1_main",
+   "path": "videos/2025-26NBA_常规赛_魔术vs凯尔特人_蔡凯臣_seg1_main.mp4",
+   "game": "魔术vs凯尔特人",
+   "cam": "main",
+   "fps": 25.0,
+   "width": 1920,
+   "height": 1080,
+   "n_frames": 750
+  },
+  {
+   "video_id": "魔术vs凯尔特人_seg2_switch",
+   "path": "videos/2025-26NBA_常规赛_魔术vs凯尔特人_蔡凯臣_seg2_switch.mp4",
+   "game": "魔术vs凯尔特人",
+   "cam": "switch",
+   "fps": 25.0,
+   "width": 1920,
+   "height": 1080,
+   "n_frames": 750
+  }
+ ]
+}
