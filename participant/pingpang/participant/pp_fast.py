@@ -30,7 +30,8 @@ from .ball_detector import IN_H, IN_W, OUT_CHANNEL, SCORE_TH
 from .ball_detector import _MEAN as MEAN
 from .ball_detector import _STD as STD
 
-__all__ = ["StageTimer", "FrameTiler", "FastTrt", "RefTrt", "gpu_index_from_env"]
+__all__ = ["StageTimer", "FrameTiler", "FastTrt", "RefTrt",
+           "gpu_index_from_env", "select_device", "decode_heat"]
 
 # 归因用途的开关（默认全部走最快路径，不设即最优）：
 #   PP_NO_DST=1     强制不用 cv2.resize(dst=)，退回安全写法（自检失败时也会自动退回）
@@ -165,7 +166,8 @@ class FrameTiler:
           即：本帧永远落在 [6:9]，历史帧依次落在 [3:6] / [0:3]。
         说明：用「轮转指针 + 按序组装」写也能得到同样的通道布局（两条路都已通过
         等价性测试）；这里保留显式搬移是因为少一次取模、时序更直观。无论怎么改，
-        动完必须重跑等价性测试（run_equiv），否则精度等价性无保障。
+        动完**必须重跑 `_check_tiler_order.py`**（通道顺序差分测试），
+        否则精度等价性无保障。
         """
         self._resize_into(frame_rgb)
         np.copyto(self._f32, self._u8)
@@ -207,7 +209,7 @@ class FastTrt:
 
         self._torch = torch
         if device is not None:
-            torch.cuda.set_device(int(device))
+            torch.cuda.set_device(select_device(torch, device))
         self.device = int(torch.cuda.current_device())
 
         self.model, self.how = load_or_build(
@@ -327,7 +329,7 @@ class RefTrt:
         from core.trt import load_or_build
 
         if device is not None:
-            torch.cuda.set_device(int(device))
+            torch.cuda.set_device(select_device(torch, device))
         self.model, self.how = load_or_build(
             onnx_path, trt_cache, input_name=input_name, shape=tuple(shape),
             fp16=fp16, log=log)
@@ -339,7 +341,10 @@ class RefTrt:
 
 
 def gpu_index_from_env() -> int | None:
-    """PP_GPU_INDEX 指定推理用的物理卡（避免与 NVDEC 抢同一张卡）。未设置则 None。"""
+    """PP_GPU_INDEX 指定推理用的物理卡（避免与 NVDEC 抢同一张卡）。未设置则 None。
+
+    只做"能否解析成整数"的判断；**范围校验放在 select_device()**，因为这里拿不到 torch。
+    """
     v = os.environ.get("PP_GPU_INDEX", "").strip()
     if not v:
         return None
@@ -347,6 +352,36 @@ def gpu_index_from_env() -> int | None:
         return int(v)
     except ValueError:
         return None
+
+
+def select_device(torch, device) -> int:
+    """解析并**校验**要用的 GPU 序号，返回实际生效的序号。
+
+    为什么必须校验（实测踩到）：
+      * `torch.cuda.set_device(99)` 在 2 卡机上抛
+        `AcceleratorError: CUDA error: invalid device ordinal`；
+        这个异常会被 solution.py 的兜底捕获并回退 RefTrt，而 RefTrt 用同一个非法
+        序号**再抛一次** -> 最终 prepare 失败 -> 整个提交 0 分。
+      * `torch.cuda.set_device(-1)` **不会报错**，会静默绑到别的卡，
+        让 PP_GPU_INDEX 的"卡隔离"意图失效。
+    两者都不是我们想要的行为，所以越界一律回退到当前设备，并且不抛异常。
+    """
+    try:
+        n = int(torch.cuda.device_count())
+    except Exception:  # noqa: BLE001 —— 取不到卡数就干脆不切卡
+        n = 0
+    cur = int(torch.cuda.current_device()) if n else 0
+    if device is None:
+        return cur
+    try:
+        idx = int(device)
+    except (TypeError, ValueError):
+        print(f"[pp_fast] PP_GPU_INDEX={device!r} 非法，沿用当前设备 {cur}", flush=True)
+        return cur
+    if n and 0 <= idx < n:
+        return idx
+    print(f"[pp_fast] PP_GPU_INDEX={idx} 越界（本机 {n} 张卡），回退设备 {cur}", flush=True)
+    return cur
 
 
 def decode_heat(heat: np.ndarray, orig_w: int, orig_h: int):
