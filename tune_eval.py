@@ -523,6 +523,125 @@ def cmd_score(a) -> int:
     return 0
 
 
+# ── align：帧对齐校准分析（精度优化的第一优先项）────────────────────────────
+def _find_peaks(rows: list, fall_amp: float, rise_amp: float, conf_th: float):
+    """在轨迹里找**所有**候选峰值（y 的局部极大 + 幅度门控 + conf 门控）。
+
+    刻意**不走 EmitRule**：这里要看的是「轨迹里到底有没有峰、峰在哪一帧」，
+    而不是最终输出了什么。两者的差值才是帧对齐问题的来源。
+    返回 [(peak_fid, report_fid, x, y, conf, fall, rise)]，report_fid = peak_fid - 1
+    （ch1 固有滞后 1 帧，同 EmitRule 的上报口径）。
+    """
+    seq = [(f, d) for f, d in rows if d is not None and d[2] >= conf_th]
+    out = []
+    for j in range(1, len(seq) - 1):
+        fid, (x, y, c) = seq[j]
+        _, (px, py, _pc) = seq[j - 1]
+        _, (nx, ny, _nc) = seq[j + 1]
+        fall, rise = y - py, y - ny
+        if y > py and y >= ny and fall >= fall_amp and rise >= rise_amp:
+            out.append((fid, max(0, fid - 1), x, y, c, fall, rise))
+    return out
+
+
+def _delta_stats(ds: list) -> str:
+    if not ds:
+        return "无样本"
+    ds = sorted(ds)
+    n = len(ds)
+    mean = sum(ds) / n
+    med = ds[n // 2] if n % 2 else (ds[n // 2 - 1] + ds[n // 2]) / 2.0
+    hit = sum(1 for d in ds if abs(d) <= HIT_FRAMES)
+    from collections import Counter
+    return (f"n={n} 命中(±1)={hit} 均值={mean:+.2f} 中位={med:+.1f} "
+            f"分布={dict(sorted(Counter(ds).items()))}")
+
+
+def cmd_align(a) -> int:
+    gt_path = Path(a.gt) if a.gt else Path(a.input) / "gt_public.jsonl"
+    gt = load_gt(gt_path)
+    videos, _ = load_videos(Path(a.input))
+    traj = Path(a.traj)
+    rows = {vid: load_traj(traj, vid) for vid in videos}
+
+    print("=" * 78)
+    print("帧对齐校准分析：Δframe = 预测帧号 - GT帧号（帧对齐正确时应集中在 0）")
+    print("=" * 78)
+    print(f"\n候选峰值门槛：fall_amp>={a.fall_amp} rise_amp>={a.rise_amp} conf>={a.conf_th}")
+
+    all_pred_deltas, all_peak_deltas = [], []
+    per_view_pred = {v: [] for v in VIEWS}
+    zero_det, no_peak, matched_peak = 0, 0, 0
+    unmatched_peaks = []
+
+    print(f"\n{'video':<9}{'视角':<6}{'GT':>4}{'TP':>4}{'FP':>4}{'FN':>4}"
+          f"   Δframe(TP: 预测-GT)")
+    for vid, m in videos.items():
+        g = gt.get(vid, {"valid": [], "invalid": []})
+        valid = g["valid"]
+        preds = replay(rows[vid], m.width, m.height, params_from_env())
+        tp, fp, fn = match_counts(preds, valid, g["invalid"])
+        ex = explain(preds, valid, g["invalid"],
+                     times={f for f, d in rows[vid] if d is not None})
+
+        # ① 已输出预测 vs GT：Δframe 分布（只统计真正匹配上的）
+        ds = [p[0] - gg[0] for (p, gg, _d) in ex["tp"]]
+        all_pred_deltas += ds
+        per_view_pred[m.angle] += ds
+
+        # ② 轨迹里的候选峰值 vs GT：看「峰本身有没有偏」
+        peaks = _find_peaks(rows[vid], a.fall_amp, a.rise_amp, a.conf_th)
+        pds, used = [], set()
+        for (pf, rf, px, py, pc, fa, ri) in peaks:
+            best = None
+            for gi, (tf, tx, ty) in enumerate(valid):
+                if gi in used:
+                    continue
+                dfd = abs(rf - tf)
+                dd = math.hypot(px - tx, py - ty)
+                if best is None or (dfd, dd) < (best[0], best[1]):
+                    best = (dfd, dd, gi, tf)
+            if best and best[1] <= HIT_DIST:
+                used.add(best[2])
+                pds.append(rf - best[3])
+                matched_peak += 1
+            else:
+                unmatched_peaks.append((vid, m.angle, rf, px, py, pc))
+        all_peak_deltas += pds
+
+        # ③ 完全没检测的 GT 帧数
+        det_frames = {f for f, d in rows[vid] if d is not None}
+        zd = sum(1 for (t, _x, _y) in valid if t not in det_frames)
+        zero_det += zd
+        npk = sum(1 for (gg, near, has) in ex["fn"] if not has)
+        no_peak += npk
+
+        print(f"{vid:<9}{m.angle:<6}{len(valid):>4}{tp:>4}{fp:>4}{fn:>4}   "
+              f"{ds if ds else '—'}")
+
+    print("\n── 总体 Δframe 分布 ──")
+    print(f"  已输出预测 vs GT : {_delta_stats(all_pred_deltas)}")
+    print(f"  候选峰值   vs GT : {_delta_stats(all_peak_deltas)}")
+    print("\n── 按视角（已输出预测）──")
+    for v in VIEWS:
+        print(f"  {v:<6} {_delta_stats(per_view_pred[v])}")
+
+    print("\n── 失效来源分解 ──")
+    print(f"  GT 所在帧完全无检测（模型漏检，判定逻辑救不了）: {zero_det} 个")
+    print(f"  有检测但没形成候选峰（门控/幅度挡掉）        : {no_peak} 个")
+    print(f"  候选峰与 GT 距离 ≤{HIT_DIST:.0f}px 的匹配数              : {matched_peak} 个")
+    if unmatched_peaks:
+        print(f"  候选峰里没对上任何 GT 的（潜在 FP 来源）      : {len(unmatched_peaks)} 个")
+        for (vid, ang, rf, px, py, pc) in unmatched_peaks[:8]:
+            print(f"      {vid} [{ang}] 上报帧 f={rf} ({px:.0f},{py:.0f}) conf={pc:.2f}")
+
+    print("\n── 判读指南 ──")
+    print("  * Δframe 均值明显偏离 0 且分布集中 → **系统性偏移**，改帧对齐即可一次性吃掉。")
+    print("  * Δframe 集中在 0 但还有大量 ±2/±3 → 峰值定位精度不够，需改峰值判定（拟合/过零）。")
+    print("  * 若『GT 所在帧完全无检测』占比高 → 瓶颈在模型召回，先别在判定逻辑上耗时间。")
+    return 0
+
+
 # ── CLI ────────────────────────────────────────────────────────────────────
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description="落点检测离线精度调参（开发工具）")
@@ -554,6 +673,15 @@ def build_parser() -> argparse.ArgumentParser:
                    help="逐视频打印 GT/TP/FP/FN/F1（核对是否靠某一条视频刷分）")
     s.add_argument("--json", default=None, help="把结果写成 json")
     s.set_defaults(func=cmd_score)
+
+    al = sub.add_parser("align", help="帧对齐校准分析：Δframe 分布 + 失效来源分解")
+    al.add_argument("--traj", required=True, help="dump 出来的轨迹目录")
+    al.add_argument("--input", required=True)
+    al.add_argument("--gt", default=None, help="默认 <input>/gt_public.jsonl")
+    al.add_argument("--fall-amp", type=float, default=2.0, help="候选峰的下降幅度门槛")
+    al.add_argument("--rise-amp", type=float, default=1.0, help="候选峰的反弹幅度门槛")
+    al.add_argument("--conf-th", type=float, default=0.75, help="候选峰的置信门槛")
+    al.set_defaults(func=cmd_align)
 
     t = sub.add_parser("selftest", help="不需要模型：验证评分器 + 量化 MIN_GAP 天花板")
     t.add_argument("--input", required=True)
