@@ -1,84 +1,86 @@
-"""参赛实现：落点检测 —— 与参考实现**逐字节等价**的精度 + 消除每帧重复开销的快速管线。
+"""乒乓球落点检测：冗余观测融合 + 轨迹清洗 + 速度折角触台判定（参考实现的重写版）。
 
-本文件相对官方参考实现（原 solution.py + ball_detector.py 组合）的**唯一**改动是
-「怎么算」，「算什么」完全不变：
+**参赛者代码区**——本文件实现 run.py 调用的四个生命周期方法
+（``prepare / reset / process_frame / finish_video``）。
 
-  不变（精度保证）：
-    * 预处理仍是 cv2.resize(frame, (512,288), INTER_LINEAR) -> /255 -> ImageNet mean/std，
-      全程 float32，逐元素同算式
-    * 仍是 3 帧滑窗 (1,9,288,512)，通道组 [0:3]/[3:6]/[6:9] = [旧,中,新]
-    * 仍解码 ch1（中间帧，固有滞后 1 帧），阈值 0.7 blob 加权质心，sx=W/512, sy=H/288
-    * 落点启发式的判定条件与 4 个参数逐字未动——实现已搬到 emit_rule.py（唯一实现，
-      提交管线 / 离线调参工具 / 等价性测试三方共用，避免参数各自漂移）
-  改动（速度）：
-    * 预处理零分配（resize 写持久 dst + 就地归一化 + 3 个持久 slot 组装滑窗），
-      取代每帧 astype/减/除/transpose/ascontiguousarray/concat 的多次大数组分配
-    * 推理零设备分配（持久 CUDA 输入输出），只 D2H 需要的 ch1 热图（少拷 1.18MB/帧）
-    * _emit 由「每帧全量重扫 O(n^2)」改为「游标增量扫描 O(n) 总计」——
-      已扫描过的 j 结论不会再变（局部极大只依赖 j-1/j/j+1；last_emit 单调不减，
-      被 MIN_GAP 挡掉的 j 之后只会更被挡掉），故结果与全量重扫严格相同
-    * 未做 ROI 裁剪：当前 ball.onnx 只在整帧 288x512 尺度下训练，裁剪会改变球的
-      像素尺度/位置分布，属于「必须重训模型才能做」的改动，不与提速混在一起
+流水线（相对参考实现的差异）：
+  1. ``prepare``：TensorRT 从 ``weights/ball.onnx`` 现场构建（缓存到临时目录，
+    刻意不放 output_dir——engine 体积会被 run.py 的 os.walk 计入「输出物 <1GB」
+    硬限制）；若 TRT 不可用则自动回退 onnxruntime（CUDA→CPU），
+    避免 engine 构建失败直接导致整场 0 分。
+  2. ``process_frame``：逐帧检测球心，按"真实所属帧"存进缓冲，本帧先不输出。
+  3. ``finish_video``：对整段轨迹做一次性分析——融合同帧的冗余通道观测 →
+    剔除离群点 → 用前后速度矢量的**折角**（Δv_y 负尖峰 = 竖直速度被瞬间反向）
+    判定触台帧 → 按视角参数 NMS 去重。框架明确允许延迟输出，用完整轨迹信息
+    判定落点远比逐帧比较 y 稳（俯视角下触台后 y 会继续增大，极值法失效，
+    实测 0°/45° 的 y 极值法 F1 仅 0.05，折角法 0.79/0.82）。
 
-速度影响：单帧省下 4~5 次大数组分配 + 1.18MB D2H 拷贝 + O(n) 重扫；每阶段实测耗时见
-run.log 的 `[pp_profile]` 行（每视频一行，StageTimer 输出）。
-精度影响：无（算术与判定逐元素等价，预测应与参考实现完全一致）。
+参数在 ``configs/landing.json``（按 0/45/90 度分别配置），缺失则用内置默认值。
+本地评分：``python3 tune_eval.py score --traj ... --input public_data``。
 """
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
-from time import perf_counter as _now      # 单调时钟；4 次/帧，开销 ~0.3us
+
+import numpy as np
 
 from core.types import Landing, RunContext, VideoMeta
 
+from .ball_detector import IN_H, IN_W, BallDetector
 from .base_solution import BaseSolution
-from . import pp_fast
-from .pp_fast import FrameTiler, RefTrt
+from .landing import clean_track, find_landings, fuse_obs
 
-# 落点判定的唯一实现在 emit_rule.py（7 个参数）：调参工具 tune_eval.py（在仓库根，
-# 刻意放在 participant/ 之外——它读 gt_public.jsonl 真值，不应打进提交镜像）
-# 与等价性测试 _check_emit_equiv.py 都 import 它，确保「扫出来的参数」与「线上跑的判定」
-# 是同一份代码。默认值 = 参考实现原值（peak_win=1 / peak_conf=0 / smooth=0 即完全等价关闭）；
-# 可用 PP_MIN_GAP/PP_CONF_TH/PP_FALL_AMP/PP_RISE_AMP/PP_PEAK_WIN/PP_PEAK_CONF/PP_SMOOTH
-# 做 A/B（不设则行为不变）。实测结论见 emit_rule.py 文件头。
-from .emit_rule import EmitRule, describe as describe_params  # noqa: E402
+_HERE = Path(__file__).resolve().parent
 
-def _env_flag(name: str, default: bool = False) -> bool:
-    """严格解析布尔型环境变量，返回 True/False。
-
-    三态语义（这是关键）：
-      * 未设置 / 空      -> 用调用方给的 default
-      * 明确的真假值     -> 按它
-      * **无法识别的值** -> 一律 False（安全基线），不沿用 default
-    刻意不用 `os.environ.get(x, "1") != "0"` 那种写法——那样任何未识别值
-    （yes / garbage / 2 …）都会把开关打开。本开关控制耗时画像：每帧多 4 次
-    clock 调用 + 每视频一行 run.log 写入，线上不该被意外打开。
-    与 emit_rule.py 的 PP_* 参数保持同一原则：意外值一律落到安全基线。
-    """
-    raw = (os.environ.get(name) or "").strip().lower()
-    if raw in ("1", "true", "yes", "on"):
-        return True
-    if raw in ("0", "false", "no", "off"):
-        return False
-    if raw == "":
-        return default            # 未设置/空 -> 用调用方的默认
-    return False                  # 兜底：无法识别 -> 安全基线（关闭）
+# ── 内置默认参数（configs/landing.json 会覆盖其中同名字段）─────────────────
+_DEFAULT_CONFIG = {
+    "detector": {
+        "score_th": 0.55,      # 热图峰值阈值（低于此值不产出观测）
+        "conf_gate": 0.60,     # 轨迹点置信度门槛（低于此值不参与拟合）
+        "channels": [1],       # 使用哪些输出通道（1=中间帧，与参考实现一致；
+                               # 模型三通道各对应一帧，实际提交用 [0,1,2] 提高召回）
+        "peak_radius": 14,     # 峰值邻域半径（288×512 尺度）
+    },
+    "landing": {
+        "default": {"dv_y": -10.0, "max_dvx_ratio": 0.5, "min_gap": 5.0,
+                    "nms": "maxy", "k": 2, "span": 4.0, "max_step": 1.0,
+                    "max_resid": 30.0, "max_gap": 6},
+    },
+}
 
 
-PROFILE = _env_flag("PP_PROFILE", default=True)   # 默认开（诊断用）；显式设 0 关闭
+def _deep_merge(base: dict, over: dict) -> dict:
+    out = dict(base)
+    for k, v in (over or {}).items():
+        if isinstance(v, dict) and isinstance(out.get(k), dict):
+            out[k] = _deep_merge(out[k], v)
+        else:
+            out[k] = v
+    return out
+
+
+def load_config() -> dict:
+    """读取 configs/landing.json 并覆盖内置默认值；任何异常都退回默认值。"""
+    cfg = _DEFAULT_CONFIG
+    path = _HERE / "configs" / "landing.json"
+    try:
+        if path.exists():
+            cfg = _deep_merge(cfg, json.loads(path.read_text(encoding="utf-8")))
+    except Exception as e:  # 配置坏了不能拖垮整场评测
+        print(f"[solution] 读取 {path} 失败，使用内置默认参数：{type(e).__name__}: {e}")
+    return cfg
 
 
 def _trt_cache_dir(output_dir) -> Path:
     """TRT engine 缓存目录——**刻意不放在 output_dir 里**。
 
-    赛道限定条件：输出物大小 < 1 GB；框架约定输出目录只含
-    predictions.jsonl / run_status.json / run.log 三样。engine 体积无法预估，
-    放进去等于给「输出物 < 1 GB」这条硬限制挂上一份不可控风险；
-    而评测容器每次都是全新的、缓存本来也命中不了，放输出目录零收益。
-
-    优先级：PP_TRT_CACHE > $TMPDIR/pp_trt_cache > /tmp/pp_trt_cache > output_dir（兜底）。
+    run.py 用 os.walk(output_dir) 递归求和，超 1GB 直接判 failed。engine 体积
+    无法预估，放进输出目录等于给这条硬限制挂上不可控风险；且评测容器每次全新，
+    缓存本来也命中不了。优先级：PP_TRT_CACHE > $TMPDIR/pp_trt_cache >
+    /tmp/pp_trt_cache > output_dir（兜底）。
     """
     cands = []
     env = os.environ.get("PP_TRT_CACHE", "").strip()
@@ -97,81 +99,160 @@ def _trt_cache_dir(output_dir) -> Path:
     return Path(output_dir) / "trt_cache"
 
 
+def _onnx_session(onnx_path: Path, decoder: str):
+    """建 onnxruntime session：既用于读 ONNX 输入签名，也作为 TRT 不可用时的回退。"""
+    import onnxruntime as ort
+
+    providers = (["CUDAExecutionProvider", "CPUExecutionProvider"]
+                 if decoder == "gpu" else ["CPUExecutionProvider"])
+    return ort.InferenceSession(str(onnx_path), providers=providers)
+
+
+def _build_infer(onnx_path: Path, ctx: RunContext):
+    """返回 (infer_fn, backend_name)。优先 TensorRT，失败回退 onnxruntime。"""
+    from .pp_fast import select_device
+
+    import torch
+    select_device(torch, os.environ.get("PP_GPU_INDEX", "").strip() or None)
+
+    sess = None
+    in_name, shape = "input", (1, 9, IN_H, IN_W)
+    try:
+        # TRT 的 optimization profile 必须用 ONNX 里的真实输入名（见 core/trt.py
+        # 的 profile.set_shape），写错会直接构建失败，所以从模型签名里读。
+        sess = _onnx_session(onnx_path, ctx.decoder)
+        sig = sess.get_inputs()[0]
+        in_name = sig.name
+        dims = [int(d) if isinstance(d, int) else 0 for d in sig.shape]
+        if all(d > 0 for d in dims):
+            shape = tuple(dims)
+        print(f"[solution] ONNX 输入 {in_name}{shape}")
+    except Exception as e:
+        print(f"[solution] 读取 ONNX 输入签名失败（{type(e).__name__}: {e}），"
+              f"按 {in_name}{shape} 处理")
+
+    try:
+        from core.trt import load_or_build
+
+        model, how = load_or_build(onnx_path, _trt_cache_dir(ctx.output_dir),
+                                   input_name=in_name, shape=shape, log=print)
+        return model.infer, f"tensorrt_{how}"
+    except Exception as e:
+        print(f"[solution] TensorRT 不可用（{type(e).__name__}: {e}），回退 onnxruntime")
+
+    if sess is None:
+        import onnxruntime as ort
+
+        providers = (["CUDAExecutionProvider", "CPUExecutionProvider"]
+                     if ctx.decoder == "gpu" else ["CPUExecutionProvider"])
+        sess = ort.InferenceSession(str(onnx_path), providers=providers)
+
+    def infer(x):
+        return sess.run(None, {in_name: np.ascontiguousarray(x)})[0]
+
+    return infer, f"onnxruntime_{sess.get_providers()[0]}"
+
+
 class Solution(BaseSolution):
-    """落点启发式：球心 y 的局部极大值 + 下落/反弹门控（含快速管线 + 耗时画像）。"""
+    """轨迹建模 + 速度折角判定的落点检测。"""
 
     # ── 生命周期 ────────────────────────────────────────────────────────────
     def prepare(self, context: RunContext) -> None:
-        # 1. 权重：只带 ONNX，TRT engine 现场构建（首跑约 5 分钟，之后从缓存秒级加载）
-        onnx_path = Path(__file__).resolve().parent / "weights" / "ball.onnx"
+        onnx_path = _HERE / "weights" / "ball.onnx"
         assert onnx_path.exists(), f"缺少权重: {onnx_path}"
-        trt_cache = _trt_cache_dir(context.output_dir)   # 不放 output_dir，避免计入「输出物 <1GB」
-        dev = pp_fast.gpu_index_from_env()
 
-        # 2. 耗时画像（默认开；PP_PROFILE=0 关闭）：每视频结束写一行到 run.log
-        self._timer = pp_fast.StageTimer(context.output_dir, enabled=PROFILE)
-        self._tiler = FrameTiler()   # 预处理缓冲必须先于 warmup 建好
+        infer_fn, backend = _build_infer(onnx_path, context)
+        self.cfg = load_config()
+        # 只把 BallDetector 认识的参数透传给它（conf_gate 是上层轨迹参数）
+        det_cfg = {k: v for k, v in self.cfg["detector"].items()
+                   if k in ("score_th", "channels", "peak_radius")}
+        # 通道必须在 [0,1,2] 内，越界会索引热图报错 → 兜底回 [1]
+        chs = tuple(c for c in det_cfg.get("channels", [1]) if c in (0, 1, 2)) or (1,)
+        det_cfg["channels"] = chs
+        self.det = BallDetector(infer_fn, onnx_path, **det_cfg)
 
-        # 3. TRT：优先零分配的 FastTrt；失败则回退 core.trt.TrtModel（语义相同）
-        try:
-            infer = pp_fast.FastTrt(onnx_path, trt_cache, device=dev, log=print)
-            backend = f"tensorrt_{infer.how}_fast"
-        except Exception as exc:  # noqa: BLE001 —— 任何构建/绑定异常都退回参考路径
-            print(f"[pp_fast] FastTrt 不可用，回退 core.trt.TrtModel: {exc}", flush=True)
-            infer = RefTrt(onnx_path, trt_cache, device=dev, log=print)
-            backend = f"tensorrt_{infer.how}_ref"
-        self._infer = infer.infer
+        # warmup：把 TRT kernel / ORT 内存池预热，避免首帧开销算进推理计时
+        self.det.detect(np.zeros((IN_H, IN_W, 3), np.uint8), IN_W, IN_H)
 
-        # 4. warmup：TRT 首次推理会触发 kernel JIT，先跑热，避免算进 infer_sec
-        for _ in range(2):
-            self._infer(self._tiler.inp)
-
-        # 5. 回填 backend 给 run_status（让平台看到是 built 还是 loaded）
         context.info["backend"] = backend
-        context.info["pipeline"] = "pp_fast_v1"
-        if dev is not None:
-            context.info["infer_device"] = dev
+        context.info["channels"] = list(self.det.channels)
+        context.info["score_th"] = self.det.score_th
 
-        # 落点判定器：唯一实现见 emit_rule.py；参数默认值 = 参考实现原值
-        self._rule = EmitRule()
+        # 开发用：PP_DUMP_DET=1 时把逐帧观测落盘，供离线调参
+        self._dump_dir = (Path(context.output_dir) / "detections"
+                          if os.environ.get("PP_DUMP_DET") else None)
 
     def reset(self, video_meta: VideoMeta) -> None:
-        self._tiler.reset()
-        self._rule.reset(video_meta.width, video_meta.height)
-        self._timer.reset(video_meta.video_id or "")
+        self.det.reset()
+        self.angle = video_meta.angle
+        self.n_frames = int(video_meta.n_frames)
+        self.width = int(video_meta.width)
+        self.height = int(video_meta.height)
+        self.video_id = video_meta.video_id
+        self.obs: dict[int, list[tuple[float, float, float]]] = {}
 
-    # ── 主循环 ──────────────────────────────────────────────────────────────
     def process_frame(self, frame_rgb, frame_meta) -> list[Landing]:
-        fid = frame_meta["frame_id"]
-        tm = self._timer
-
-        t0 = _now()
-        inp = self._tiler.push(frame_rgb)          # resize + 归一化 + 滑窗组装
-        tm.add("preproc", _now() - t0)
-
-        t0 = _now()
-        heat = self._infer(inp)                    # TRT + D2H(ch1)
-        tm.add("infer", _now() - t0)
-
-        t0 = _now()
-        det = pp_fast.decode_heat(heat, frame_meta["width"], frame_meta["height"])
-        tm.add("decode", _now() - t0)
-
-        # ch1 解码本身滞后 1 帧；再等 2 个轨迹点确认局部极大（判定见 emit_rule.EmitRule）
-        t0 = _now()
-        out = self._rule.tick(fid, det)
-        tm.add("emit", _now() - t0)
-        tm.n += 1
-        return out
+        fid = int(frame_meta["frame_id"])
+        for off, x, y, conf in self.det.detect(
+                frame_rgb, frame_meta["width"], frame_meta["height"]):
+            key = fid + off
+            if key >= 0:
+                self.obs.setdefault(key, []).append((x, y, conf))
+        return []  # 延迟到 finish_video 统一分析（框架允许）
 
     def finish_video(self, video_meta: VideoMeta) -> list[Landing]:
-        # 尾帧降级：至少 1 个未来点也允许判定，避免丢视频末尾落点
-        out = self._rule.flush()
-        self._timer.report(
-            extra=f"traj={self._rule.n_traj} landings={self._rule.n_emitted} "
-                  f"[{describe_params()}]")
+        try:
+            return self._analyze()
+        except Exception as e:  # 单视频失败不能崩掉整场
+            print(f"[solution] {video_meta.video_id} 落点分析失败："
+                  f"{type(e).__name__}: {e}")
+            return []
+
+    # ── 内部 ────────────────────────────────────────────────────────────────
+    def _analyze(self) -> list[Landing]:
+        fused = fuse_obs(self.obs)
+        points = sorted((f, x, y, c) for f, (x, y, c) in fused.items())
+        if len(points) < 3:
+            return []
+        if self._dump_dir is not None:
+            self._dump(points)
+
+        det_cfg = self.cfg["detector"]
+        conf_gate = float(det_cfg.get("conf_gate", 0.6))
+        gated = [p for p in points if p[3] >= conf_gate]
+        if len(gated) >= 3:
+            points = gated
+
+        land_cfg = self.cfg["landing"]
+        cfg = _deep_merge(land_cfg.get("default", {}),
+                          land_cfg.get(self.angle, {}))
+        points = clean_track(points,
+                             max_resid=float(cfg.get("max_resid", 30.0)),
+                             max_gap=int(cfg.get("max_gap", 6)))
+
+        raw = find_landings(points, cfg)
+
+        out: list[Landing] = []
+        for fid, x, y, _score in raw:
+            if not (0 <= fid < self.n_frames):
+                continue
+            # 框架不会自动 clip，越界直接判非法 → 自己夹紧到合法半开区间
+            cx = min(max(float(x), 0.0), self.width - 1e-3)
+            cy = min(max(float(y), 0.0), self.height - 1e-3)
+            out.append(Landing(frame_id=fid, x=cx, y=cy))
         return out
 
-    # 落点判定逻辑已整体移至 emit_rule.EmitRule（唯一实现）：
-    # 好处是离线调参工具、等价性测试、提交管线用的是同一份代码，参数不会各自漂移。
-
+    def _dump(self, points) -> None:
+        try:
+            self._dump_dir.mkdir(parents=True, exist_ok=True)
+            doc = {
+                "video_id": self.video_id, "angle": self.angle,
+                "n_frames": self.n_frames, "width": self.width,
+                "height": self.height,
+                "points": [[float(p[0]), float(p[1]), float(p[2]), float(p[3])]
+                           for p in points],
+            }
+            (self._dump_dir / f"{self.video_id}.json").write_text(
+                json.dumps(doc), encoding="utf-8")
+        except Exception as e:
+            print(f"[solution] dump {self.video_id} 失败：{e}")

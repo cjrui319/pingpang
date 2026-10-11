@@ -49,6 +49,11 @@ participant/*/participant/models/*.onnx
 *.tar.gz
 *.tgz
 
+# --- 本地评测启动器（开发用，不进仓库）---
+# tune_eval.py 本身是要跟踪的；pp_eval.cmd 只是本机调用它的包装
+pp_eval.cmd
+pp_eval.ps1
+
 # --- 个人/隐私文档一律不进 Git ---
 # 本仓库是公开的。实际踩到过：仓库根出现过学生资助名单 xlsx
 # （附件4-...国家助学金拟推荐名单...）。当时它未被任何规则覆盖，

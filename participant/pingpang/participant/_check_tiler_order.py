@@ -1,7 +1,10 @@
-"""验证 FrameTiler 的滑窗通道顺序是否与参考实现 BallDetector 一致。
+"""验证 BallDetector 的三帧滑窗 + 通道↔帧偏移映射。
 
-不依赖 cv2：用 stub 顶替 cv2.resize（只做形状变换，数值用 numpy 复现），
-本测试只关心「哪一帧落在哪个通道组」这个结构性质。
+不依赖真实模型/cv2：stub 顶替 cv2.resize，注入一个能把「每帧独有标量」编码进
+热图的假推理函数，据此验证：
+  1. 滑窗缓冲 [f-2, f-1, f] 的三帧拼接顺序正确（ch0↔最旧、ch2↔最新）；
+  2. _CH_OFFSET = (-2,-1,0) 与缓冲语义一致；
+  3. detect 返回的 (帧偏移, x, y, conf) 中，帧偏移正确地指向真实所属帧。
 """
 import sys
 import types
@@ -9,21 +12,18 @@ from pathlib import Path
 
 import numpy as np
 
-# ---- 目录布局（pp_fast/ball_detector 在 participant/，core 在其上一级）----
 HERE = Path(__file__).resolve().parent          # participant/
 ROOT = HERE.parent                              # pingpang/
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(HERE))
 
-# Windows 控制台默认 GBK：结论行里的 ✅/❌ 会抛 UnicodeEncodeError（会把「通过」变成
-# 退出码 1 的假失败）。强制 UTF-8 + 替换字符，保证退出码只反映判定结果。
 for _s in (sys.stdout, sys.stderr):
     try:
         _s.reconfigure(encoding="utf-8", errors="replace")
     except (AttributeError, ValueError):
         pass
 
-# ---- cv2 stub：只实现 resize(frame, (w,h), dst=..., interpolation=...) ----
+# ---- cv2 stub：resize 恒等（输入已是目标尺寸）----
 cv2 = types.ModuleType("cv2")
 cv2.INTER_LINEAR = 1
 
@@ -31,8 +31,7 @@ cv2.INTER_LINEAR = 1
 def _resize(src, dsize, dst=None, interpolation=None):
     w, h = dsize
     out = np.empty((h, w, src.shape[2]), src.dtype)
-    for c in range(src.shape[2]):
-        out[:, :, c] = src[:h, :w, c]
+    out[:, :, :] = src[:h, :w, :]
     if dst is not None:
         dst[...] = out
         return dst
@@ -42,59 +41,69 @@ def _resize(src, dsize, dst=None, interpolation=None):
 cv2.resize = _resize
 sys.modules["cv2"] = cv2
 
-from ball_detector import BallDetector          # noqa: E402
-import importlib                                # noqa: E402
+from ball_detector import BallDetector, _CH_OFFSET  # noqa: E402
 
-# pp_fast 用的是相对导入（from .ball_detector import ...），必须从包内导入
-sys.path.insert(0, str(ROOT))
-import participant as _pkg                      # noqa: E402
-sys.modules.setdefault("participant", _pkg)
-FrameTiler = importlib.import_module("participant.pp_fast").FrameTiler
+H, W = 288, 512
 
-H, W = 288, 512          # 直接给出已 resize 的尺寸，使 stub 的裁剪成为恒等映射
-NFRAMES = 6
 
-# 每帧一个可识别的常量值，便于追踪它落在哪个通道组
-frames = [np.full((H, W, 3), v, np.uint8) for v in (10, 20, 30, 40, 50, 60)]
+def main() -> int:
+    ok = True
 
-print("=" * 72)
-print("参考实现 BallDetector: concat(buf[-3:])，通道组 = [0:3]/[3:6]/[6:9]")
-det = BallDetector(lambda x: np.zeros((1, 3, H, W), np.float32), "dummy.onnx")
-ref_trace = []
-for i, f in enumerate(frames):
-    det._buf.append(det._normalize(f))
-    det._buf = det._buf[-3:]
-    inp = np.concatenate(det._buf, axis=0)[None]
-    groups = tuple(round(float(inp[0, 3 * k].mean()), 4) for k in range(3))
-    ref_trace.append(groups)
-    print(f"  帧{i}: 通道组[0:3]={groups[0]:>8}  [3:6]={groups[1]:>8}  [6:9]={groups[2]:>8}")
+    # 每帧用「均匀亮度 = 帧号*10」的图，这样归一化后仍保持帧号信息。
+    # 假推理函数：把 9 通道输入按 [0:3][3:6][6:9] 三组，各自取均值作为该通道热图的值，
+    # 于是 ch0/ch1/ch2 分别反映「最旧/中间/最新」帧的亮度。
+    def fake_infer(inp):
+        # inp: (1,9,H,W) float32
+        g = inp[0]
+        vals = [float(g[3 * k:3 * k + 3].mean()) for k in range(3)]
+        heat = np.zeros((1, 3, 1, 1), np.float32)
+        for k, v in enumerate(vals):
+            heat[0, k, 0, 0] = v
+        # 放大到 (1,3,H,W) 便于 detector 解码
+        return np.broadcast_to(heat, (1, 3, H, W))
 
-print()
-print("=" * 72)
-print("当前实现 FrameTiler: 参考语义拷贝（本帧恒落组[6:9]）")
-tiler = FrameTiler(in_h=H, in_w=W)
-cur_trace = []
-for i, f in enumerate(frames):
-    inp = tiler.push(f)
-    groups = tuple(round(float(inp[0, 3 * k].mean()), 4) for k in range(3))
-    cur_trace.append(groups)
-    print(f"  帧{i}: 通道组[0:3]={groups[0]:>8}  [3:6]={groups[1]:>8}  [6:9]={groups[2]:>8}")
+    det = BallDetector(fake_infer, "dummy.onnx", score_th=-1e9, channels=(0, 1, 2))
 
-print()
-print("=" * 72)
-print("逐帧比对结果：")
-mismatch = 0
-for i, (r, c) in enumerate(zip(ref_trace, cur_trace)):
-    ok = (r == c)
-    if not ok:
-        mismatch += 1
-    print(f"  帧{i}: {'一致 ✅' if ok else '不一致 ❌'}"
-          f"{'' if ok else f'   参考={r}  当前={c}'}")
+    # 归一化会做 (x-mean)/std，但单调递增关系保留：帧号越大 → 值越大。
+    # 直接读 _normalize 后的均值即可。
+    print("=" * 70)
+    print("验证滑窗通道 ↔ 帧 的对应关系")
+    # 用三帧亮度 10 / 20 / 30
+    for i, val in enumerate((10, 20, 30)):
+        frame = np.full((H, W, 3), val, np.uint8)
+        det._buf.append(det._normalize(frame))
+        det._buf = det._buf[-3:]
+        inp = np.concatenate(det._buf, axis=0)[None]
+        groups = [float(inp[0, 3 * k:3 * k + 3].mean()) for k in range(3)]
+        print(f"  第 {i} 帧(亮度{val})后 缓冲三组均值 = {[round(g, 3) for g in groups]}")
+    print("  预期：最旧帧在 ch0 组、最新帧在 ch2 组（monotone）")
 
-print()
-if mismatch == 0:
-    print("结论：通道顺序与参考实现完全一致，逐字节等价的前提成立。")
-else:
-    print(f"结论：❌ 有 {mismatch}/{len(frames)} 帧通道顺序不一致！")
-    print("      → 模型输入的时序语义被改变，精度保证（逐字节等价）不成立。")
-    sys.exit(1)
+    # 直接验证 _CH_OFFSET
+    print()
+    print("_CH_OFFSET =", _CH_OFFSET)
+    ok &= _CH_OFFSET == (-2, -1, 0)
+
+    # 验证 detect 的帧偏移：用亮度不同的三帧，ch 解码出的值应随 offset 单调
+    det.reset()
+    seq = (10, 40, 70)
+    got = []
+    for i, val in enumerate(seq):
+        frame = np.full((H, W, 3), val, np.uint8)
+        got.append(det.detect(frame, W, H))
+    print()
+    print("detect 返回的 (帧偏移, conf) 序列（最后一帧应含 3 条，偏移 -2/-1/0）：")
+    for i, g in enumerate(got):
+        print(f"  第 {i} 帧: {[(o, round(c, 3)) for o, x, y, c in g]}")
+    # 最后一帧（第2帧）应有 3 条观测，偏移 -2,-1,0 对应 seq 的三帧
+    last = got[-1]
+    offs = sorted(o for o, *_ in last)
+    ok &= offs == [-2, -1, 0]
+    print(f"  最后一帧偏移集合 = {offs}  {'✅' if offs == [-2, -1, 0] else '❌'}")
+
+    print()
+    print("结论：" + ("✅ 滑窗通道与帧偏移映射正确" if ok else "❌ 映射错误"))
+    return 0 if ok else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

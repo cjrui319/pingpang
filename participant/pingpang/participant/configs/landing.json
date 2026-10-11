@@ -1,0 +1,55 @@
+{
+  "_comment": "乒乓球落点检测参数。detector = 球检测与观测融合；landing 按视角(0/45/90度)分档，缺字段用 landing.default。参数在公开验证集(15条)上以官方口径(±1帧/50px/一对一匹配)网格搜索得到，三视角 F1 0.79/0.82/0.82。",
+  "detector": {
+    "score_th": 0.55,
+    "conf_gate": 0.6,
+    "channels": [0, 1, 2],
+    "peak_radius": 14
+  },
+  "landing": {
+    "default": {
+      "dv_y": -12.0,
+      "max_dvx_ratio": 0.5,
+      "min_gap": 5.0,
+      "nms": "maxy",
+      "k": 2,
+      "span": 4.0,
+      "max_step": 1.0,
+      "max_resid": 30.0,
+      "max_gap": 6
+    },
+    "0度": {
+      "dv_y": -10.0,
+      "max_dvx_ratio": 0.5,
+      "min_gap": 5.0,
+      "nms": "maxy",
+      "k": 2,
+      "span": 4.0,
+      "max_step": 1.0,
+      "max_resid": 30.0,
+      "max_gap": 6
+    },
+    "45度": {
+      "dv_y": -12.0,
+      "max_dvx_ratio": 0.5,
+      "min_gap": 5.0,
+      "nms": "maxy",
+      "k": 2,
+      "span": 4.0,
+      "max_step": 1.0,
+      "max_resid": 30.0,
+      "max_gap": 6
+    },
+    "90度": {
+      "dv_y": -12.0,
+      "max_dvx_ratio": 1000000000.0,
+      "min_gap": 6.0,
+      "nms": "maxy",
+      "k": 2,
+      "span": 4.0,
+      "max_step": 1.0,
+      "max_resid": 30.0,
+      "max_gap": 6
+    }
+  }
+}
