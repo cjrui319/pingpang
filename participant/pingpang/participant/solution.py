@@ -31,7 +31,8 @@ from core.types import Landing, RunContext, VideoMeta
 
 from .ball_detector import IN_H, IN_W, BallDetector
 from .base_solution import BaseSolution
-from .landing import clean_track, find_landings, fuse_obs
+from .landing import (clean_track, find_landings, fuse_obs, keep_in_roi,
+                      table_roi)
 
 _HERE = Path(__file__).resolve().parent
 
@@ -45,9 +46,14 @@ _DEFAULT_CONFIG = {
         "peak_radius": 14,     # 峰值邻域半径（288×512 尺度）
     },
     "landing": {
-        "default": {"dv_y": -10.0, "max_dvx_ratio": 0.5, "min_gap": 5.0,
+        "default": {"dv_y": -12.0, "max_dvx_ratio": 0.5, "min_gap": 5.0,
                     "nms": "maxy", "k": 2, "span": 4.0, "max_step": 1.0,
-                    "max_resid": 30.0, "max_gap": 6},
+                    "max_resid": 30.0, "max_gap": 6, "roi_min_keep": 0.5},
+        "0度": {"dv_y": -10.0, "roi": [0.4222, 0.274, 0.6014, 0.6429]},
+        "45度": {"dv_y": -12.0, "roi": [0.2731, 0.3453, 0.7277, 0.617],
+                 "dv_strong": 25.0, "ratio_strong": 0.7},
+        "90度": {"dv_y": -12.0, "max_dvx_ratio": 1.0, "min_gap": 6.0,
+                 "nms": "combo", "roi": [0.3417, 0.3246, 0.669, 0.7528]},
     },
 }
 
@@ -230,7 +236,10 @@ class Solution(BaseSolution):
                              max_resid=float(cfg.get("max_resid", 30.0)),
                              max_gap=int(cfg.get("max_gap", 6)))
 
+        # 落点判定：速度折角判据（landing.py）→ 球台投影区门控（ROI）。
         raw = find_landings(points, cfg)
+        raw = keep_in_roi(raw, table_roi(cfg.get("roi"), self.width, self.height),
+                          min_keep=float(cfg.get("roi_min_keep", 0.5)))
 
         out: list[Landing] = []
         for fid, x, y, _score in raw:

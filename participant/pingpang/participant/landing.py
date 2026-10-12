@@ -1,19 +1,17 @@
-"""落点判定：轨迹清洗 + 触台"速度折角"检测（纯 numpy，无框架依赖）。
+﻿"""落点判定：轨迹清洗 + 触台"折角"检测（纯 numpy，无框架依赖）。
 
 数据流：``{frame_id: [(x, y, conf), ...]}``（多通道冗余观测）
         → ``fuse_obs`` 合并成 ``{frame_id: (x, y, conf)}``
         → ``clean_track`` 剔除离群点得到按帧排序的 ``[(f, x, y, conf)]``
         → ``find_landings`` 用"球心速度矢量的剧烈折转"定位触台帧。
 
-物理依据（与 SPIN 数据集论文的 bounce-inflection 方法一致：滑动窗口拟合 →
-竖直速度符号反转 → NMS）：
-  触台瞬间只有**竖直速度反向**（水平速度基本不变）。该突变在图像上表现为
-  球心速度矢量的一次折转，且与视角无关：
+物理依据：触台瞬间只有**竖直速度反向**（水平速度基本不变），该突变在图像上
+表现为球心速度矢量的一次折转，且与视角无关：
 
-  * 90 度（侧视）：折角最大，此时恰好等价于"y 的局部极大"；
-  * 0/45 度（沿球台纵深俯视）：触台后球同时远离相机，``y`` 可能继续增大，
-    "y 取极大"这一朴素判据会整体偏移 3~8 帧（实测 F1 只有 0.05），而 ``Δv_y``
-    的负向尖峰仍精确落在触台帧上。
+* 90 度（侧视）：折角最大，此时恰好等价于"y 的局部极大"；
+* 0/45 度（沿球台纵深俯视）：触台后球同时远离相机，``y`` 可能继续增大，
+  "y 取极大"这一朴素判据会整体偏移 3~8 帧（实测 F1 只有 0.05），而 ``Δv_y``
+  的负向尖峰仍精确落在触台帧上。
 
 判据：``Δv_y = v_y(后) - v_y(前)`` 足够负（下落被瞬间抬升），且
 ``|Δv_x| <= ratio·|Δv_y|``——后者是"竖直反跳在图像中的投影方向"约束，能滤掉
@@ -108,14 +106,10 @@ def kink_candidates(points: list[tuple[float, float, float, float]],
 
     每个候选帧用**前后各 k 个点**分别线性拟合 x/y，得到触台前后两个速度矢量，
     ``Δv = v_后 - v_前``。真触台的 ``Δv_y`` 是负尖峰；``Δv_x`` 用于方向一致性过滤。
-    与筛选阈值无关，因此可被离线网格搜索缓存（只算一次）。
+    与筛选阈值无关，因此可被 dev/tune.py 缓存后网格搜索（只算一次）。
 
     ``max_step``：紧邻的前后观测必须在这么多帧内。轨迹断口（丢检/末端野点）会
     制造出 ±100px/帧² 量级的伪折角——实测这类伪折角是 FP 的主要来源之一。
-
-    注：曾试过额外要求「速度符号真正反转」（v前>0 且 v后<0），实测反而把 F1
-    从 0.816 拉到 0.651（0° 俯视角下球接近球台的方向不恒定，符号约束误杀真触台），
-    故不采用。
     """
     n = len(points)
     if n < 3:
@@ -139,23 +133,82 @@ def kink_candidates(points: list[tuple[float, float, float, float]],
     return out
 
 
+def _nms_key(c: tuple[float, float, float, float, float, float], nms: str) -> float:
+    """NMS 排序键：**键越小越优先**。"""
+    if nms == "dv":
+        return c[3] * c[5]                    # 折角最猛者优先（等价 -(-Δv_y·conf)）
+    if nms == "combo":
+        # 折角强度 × 方向一致性：Δv_y 负得越多、|Δv_x|/|Δv_y| 越小越优先。
+        # 实测比 maxy 更稳：同一窗口里"最猛的一折"才是触台帧，而最低点可能落在
+        # 触台后 1~2 帧（球继续远离相机，y 更低），导致整窗选错帧。
+        return -((-c[3]) * c[5] / (1.0 + abs(c[4]) / max(abs(c[3]), 1e-9)))
+    return -c[2]                              # maxy：最低点优先（历史行为）
+
+
 def pick_landings(cands: list[tuple[float, float, float, float, float, float]],
                   dv_y: float = -10.0, max_dvx_ratio: float = 0.5,
-                  min_gap: float = 6.0, nms: str = "maxy"
+                  min_gap: float = 6.0, nms: str = "maxy",
+                  dv_strong: float = 0.0, ratio_strong: float = 0.0
                   ) -> list[tuple[int, float, float, float]]:
-    """从折角信号里挑出落点（阈值 + 方向一致 + NMS）。"""
-    keep = [c for c in cands
-            if c[3] <= dv_y and abs(c[4]) <= max_dvx_ratio * abs(c[3])]
-    if nms == "dv":
-        ordered = sorted(keep, key=lambda c: -c[3] * c[5])   # 折角最猛者优先
-    else:
-        ordered = sorted(keep, key=lambda c: -c[2])          # 最低点优先
+    """从折角信号里挑出落点（阈值 + 方向一致 + NMS）。
+
+    ``dv_strong``/``ratio_strong``：强折角的宽松档。侧旋或斜视角下真触台的
+    水平速度也可能明显变化（实测 45 度有真落点 ``|Δv_x|/|Δv_y|`` 高达 0.65~0.92
+    被 0.5 的硬门槛误杀，而同窗口被保留下来的反而是偏差 50px+ 的假折角）。
+    因此当 ``|Δv_y| >= dv_strong``（折角远超噪声，几乎不可能是轨迹跳变）时，
+    放宽到 ``|Δv_x| <= ratio_strong·|Δv_y|``。设 0 关闭该档。
+
+    ``nms``：``maxy`` 最低点优先 / ``dv`` 折角最猛者优先 / ``combo`` 折角强度×
+    方向一致性优先。
+    """
+    strong = dv_strong > 0.0
+    keep = []
+    for c in cands:
+        if c[3] > dv_y:
+            continue
+        if abs(c[4]) <= max_dvx_ratio * abs(c[3]):
+            keep.append(c)
+        elif strong and abs(c[3]) >= dv_strong and abs(c[4]) <= ratio_strong * abs(c[3]):
+            keep.append(c)
+    ordered = sorted(keep, key=lambda c: _nms_key(c, nms))
     picked: list[tuple[int, float, float, float]] = []
     for c in ordered:
         if all(abs(c[0] - p[0]) >= min_gap for p in picked):
             picked.append((int(c[0]), c[1], c[2], -c[3] * c[5]))
     picked.sort(key=lambda t: t[0])
     return picked
+
+
+def table_roi(cfg_roi, width: float, height: float):
+    """把配置里的归一化球台投影区 ``[x0, y0, x1, y1]``（0~1 比例）换成像素框。
+
+    归一化而非绝对像素：视频分辨率变了照样能用（整套参数都是按公开验证集
+    的机位标定的，属于机位常量，和 ``dv_y``/``max_step`` 一样是超参）。
+    """
+    if not cfg_roi:
+        return None
+    x0, y0, x1, y1 = (float(v) for v in cfg_roi)
+    return (x0 * width, y0 * height, x1 * width, y1 * height)
+
+
+def keep_in_roi(picked: list[tuple[int, float, float, float]], roi,
+                min_keep: float = 0.5) -> list[tuple[int, float, float, float]]:
+    """丢掉球台投影区之外的落点（触台只可能发生在台面上）。
+
+    这是本方案里收益最大的单点改动：0/45/90 度各有相当一部分 FP 是**球已离台后
+    在台外（地面/挡板）反弹**——那确实是一次真实的抛物线折角，Δv_y 信号和台内
+    触台无法区分，只有"落点位置不在台面投影内"能判掉。
+
+    fail-open 保护：若过滤后只剩不到 ``min_keep`` 比例，说明 ROI 先验与当前视频
+    的机位不符（换了机位/裁剪），此时整体放弃过滤，宁可放过 FP 也不要丢掉真落点。
+    """
+    if not roi or len(picked) < 2:
+        return picked
+    x0, y0, x1, y1 = roi
+    kept = [p for p in picked if x0 <= p[1] <= x1 and y0 <= p[2] <= y1]
+    if len(kept) < min_keep * len(picked):
+        return picked
+    return kept
 
 
 def find_landings(points: list[tuple[float, float, float, float]], cfg: dict
@@ -169,12 +222,17 @@ def find_landings(points: list[tuple[float, float, float, float]], cfg: dict
     * ``max_step``       紧邻前后观测的最大帧距（默认 2；轨迹断口会伪造巨折角）
     * ``dv_y``           Δv_y 阈值，越小越严（默认 -10.0）
     * ``max_dvx_ratio``  |Δv_x| / |Δv_y| 上限（默认 0.5）
+    * ``dv_strong``      强折角档：|Δv_y| 超过它时改用下面的 ratio（默认 0=关闭）
+    * ``ratio_strong``   强折角档的 |Δv_x| / |Δv_y| 上限
     * ``min_gap``        两个落点之间的最小帧间隔（NMS，默认 6）
-    * ``nms``            重叠候选保留谁：``maxy`` 取最低点 / ``dv`` 取折角最猛者
+    * ``nms``            重叠候选保留谁：``maxy`` 最低点 / ``dv`` 折角最猛者 /
+                         ``combo`` 折角强度×方向一致性
     """
     cands = kink_candidates(points, int(cfg.get("k", 2)), float(cfg.get("span", 6)),
                             float(cfg.get("max_step", 2.0)))
     return pick_landings(cands, float(cfg.get("dv_y", -10.0)),
                          float(cfg.get("max_dvx_ratio", 0.5)),
                          float(cfg.get("min_gap", 6)),
-                         str(cfg.get("nms", "maxy")))
+                         str(cfg.get("nms", "maxy")),
+                         float(cfg.get("dv_strong", 0.0)),
+                         float(cfg.get("ratio_strong", 0.0)))
