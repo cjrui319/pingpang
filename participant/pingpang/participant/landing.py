@@ -1,4 +1,4 @@
-﻿"""落点判定：轨迹清洗 + 触台"折角"检测（纯 numpy，无框架依赖）。
+"""落点判定：轨迹清洗 + 触台"折角"检测（纯 numpy，无框架依赖）。
 
 数据流：``{frame_id: [(x, y, conf), ...]}``（多通道冗余观测）
         → ``fuse_obs`` 合并成 ``{frame_id: (x, y, conf)}``
@@ -30,10 +30,11 @@ import numpy as np
 
 def fuse_obs(per_frame: dict, cluster_eps: float = 20.0
              ) -> dict[int, tuple[float, float, float]]:
-    """把同一帧的多条观测合并成一条：以最高置信度为种子做邻域聚类后取均值。
+    """把同一帧的多条观测合并成一条：贪心聚类后取「数量最多」那簇（多数票）。
 
-    若模型三通道确实各对应一帧，则三条观测几乎重合 → 求平均（降噪）；
-    若只有部分通道可用，则离群观测被 ``cluster_eps`` 过滤掉。
+    之前以「最高置信度」为种子聚类，会把多通道一致的真球（弱峰）当噪声丢——
+    因为孤立干扰峰往往单通道、置信度反而更高。改成多数票：真球通常是多通道
+    一致的那簇，孤立点只有一条通道。数量平手再比置信度。
     """
     out: dict[int, tuple[float, float, float]] = {}
     for fid, obs in per_frame.items():
@@ -42,14 +43,24 @@ def fuse_obs(per_frame: dict, cluster_eps: float = 20.0
         if len(obs) == 1:
             out[fid] = (float(obs[0][0]), float(obs[0][1]), float(obs[0][2]))
             continue
-        seed = max(obs, key=lambda o: o[2])
-        grp = [o for o in obs
-               if math.hypot(o[0] - seed[0], o[1] - seed[1]) <= cluster_eps]
-        xs = [o[0] for o in grp]
-        ys = [o[1] for o in grp]
-        cs = [o[2] for o in grp]
-        out[fid] = (float(sum(xs) / len(xs)), float(sum(ys) / len(ys)),
-                    float(max(cs)))
+        # 贪心聚类：按置信度降序取种子，把 eps 内的点并进同一簇。
+        remaining = sorted(obs, key=lambda o: -o[2])
+        clusters: list[tuple[float, float, float, int]] = []
+        while remaining:
+            seed = remaining.pop(0)
+            grp = [seed]
+            i = 0
+            while i < len(remaining):
+                if math.hypot(remaining[i][0] - seed[0],
+                              remaining[i][1] - seed[1]) <= cluster_eps:
+                    grp.append(remaining.pop(i))
+                else:
+                    i += 1
+            clusters.append((sum(o[0] for o in grp) / len(grp),
+                             sum(o[1] for o in grp) / len(grp),
+                             max(o[2] for o in grp), len(grp)))
+        best = max(clusters, key=lambda c: (c[3], c[2]))  # 数量优先，平手看置信度
+        out[fid] = (float(best[0]), float(best[1]), float(best[2]))
     return out
 
 
