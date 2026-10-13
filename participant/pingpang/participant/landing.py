@@ -247,3 +247,89 @@ def find_landings(points: list[tuple[float, float, float, float]], cfg: dict
                          str(cfg.get("nms", "maxy")),
                          float(cfg.get("dv_strong", 0.0)),
                          float(cfg.get("ratio_strong", 0.0)))
+
+
+def _depart_slope(points: list[tuple[float, float, float, float]],
+                  f_land: float, k: int = 3, span: float = 6.0) -> float | None:
+    """落点后 k 帧内的 y 斜率（负 = 球向上弹起，正 = 继续下落/贴台滚）。"""
+    idx = [i for i, p in enumerate(points) if abs(p[0] - f_land) <= 1]
+    if not idx:
+        return None
+    i = idx[0]
+    after = [(points[j][0], points[j][2]) for j in range(i + 1, min(len(points), i + k + 1))
+             if points[j][0] - points[i][0] <= span]
+    if len(after) < 2:
+        return None
+    f0, y0 = after[0]
+    f1, y1 = after[-1]
+    return (y1 - y0) / (f1 - f0)
+
+
+def rally_filter(points: list[tuple[float, float, float, float]],
+                 raw_landings: list[tuple[int, float, float, float]],
+                 roi=None, angle: str | None = None) -> list[tuple[int, float, float, float]]:
+    """回合状态机：用轨迹 + 球台信息抑制干扰落点（不动 Δv_y 判据）。
+
+    三类干扰（公开验证集实测，全部是真实强反弹但标注员不算）：
+
+    1. **回合后弹跳**：球飞出/被收走后轨迹进入「静态阶段」——连续 >= 8 帧位置
+       几乎不动（< 3px/帧）。球在回合中不可能停住 8 帧以上，出现静态阶段即球已
+       消失，其后（重新活跃前）的落点属于新回合/场外，抑制。
+    2. **桌边反弹**：球撞台边弹飞，离开速度极端（|y 斜率| > 60 px/帧），球不再
+       回来。正常触台的向上弹起斜率最多 ~40，台边反弹会到 100+。
+    3. **二次弹跳**：相邻两落点帧距 <= 8 且落点接近（< 200px）且后者弹起弱
+       （|斜率| < 20）——球几乎没离开台面就再触一次，标注员只算第一次。
+    4. **90 度同侧连续**：侧视下正常回合球每次触台必过网（左右交替），连续两次
+       落在球台同侧 = 回合后/无回球，抑制后者。
+    """
+    if not raw_landings:
+        return []
+
+    # 1) 静态阶段：找第一个 >= 8 帧的「位置几乎不动」段
+    static_end: float | None = None
+    start = None
+    for i in range(1, len(points)):
+        dx = points[i][1] - points[i - 1][1]
+        dy = points[i][2] - points[i - 1][2]
+        if math.hypot(dx, dy) < 3.0:
+            if start is None:
+                start = i - 1
+        else:
+            if start is not None and (i - start) >= 8:
+                static_end = points[i - 1][0]
+                break
+            start = None
+
+    dep = {f: _depart_slope(points, f) for f, _x, _y, _s in raw_landings}
+
+    # 4) 90 度：球台 x 中线
+    mid_x = None
+    if angle == "90度" and roi and len(roi) == 4:
+        mid_x = (roi[0] + roi[2]) / 2.0
+
+    kept: list[tuple[int, float, float, float]] = []
+    prev = None
+    prev_side = None
+    for f, x, y, _s in raw_landings:
+        if static_end is not None and f > static_end:
+            continue
+        s = dep.get(f)
+        # 2) 桌边反弹：极端离开速度
+        if s is not None and abs(s) > 60.0:
+            continue
+        # 3) 二次弹跳
+        if prev is not None:
+            pf, px, py = prev
+            d = math.hypot(x - px, y - py)
+            if (f - pf) <= 8 and d < 200.0 and s is not None and abs(s) < 20.0:
+                continue
+        # 4) 90 度同侧连续
+        if mid_x is not None and prev_side is not None:
+            side = "L" if x < mid_x else "R"
+            if side == prev_side:
+                continue
+        kept.append((f, x, y, _s))
+        prev = (f, x, y)
+        if mid_x is not None:
+            prev_side = "L" if x < mid_x else "R"
+    return kept

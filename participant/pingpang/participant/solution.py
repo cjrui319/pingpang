@@ -32,7 +32,7 @@ from core.types import Landing, RunContext, VideoMeta
 from .ball_detector import IN_H, IN_W, BallDetector
 from .base_solution import BaseSolution
 from .landing import (clean_track, find_landings, fuse_obs, keep_in_roi,
-                      table_roi)
+                      rally_filter, table_roi)
 
 _HERE = Path(__file__).resolve().parent
 
@@ -238,8 +238,10 @@ class Solution(BaseSolution):
 
         # 落点判定：速度折角判据（landing.py）→ 球台投影区门控（ROI）。
         raw = find_landings(points, cfg)
-        raw = keep_in_roi(raw, table_roi(cfg.get("roi"), self.width, self.height),
-                          min_keep=float(cfg.get("roi_min_keep", 0.5)))
+        roi = table_roi(cfg.get("roi"), self.width, self.height)
+        raw = keep_in_roi(raw, roi, min_keep=float(cfg.get("roi_min_keep", 0.5)))
+        # 回合状态机：抑制回合后/桌边反弹/二次弹跳等干扰落点（不改 Δv_y 判据）。
+        raw = rally_filter(points, raw, roi, angle=self.angle)
 
         out: list[Landing] = []
         for fid, x, y, _score in raw:
