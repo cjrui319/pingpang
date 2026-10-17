@@ -117,7 +117,7 @@ def _build_infer(onnx_path: Path, ctx: RunContext):
         model, how = load_or_build(onnx_path, Path(ctx.output_dir) / "trt_cache",
                                    input_name=in_name, shape=shape, log=print)
         try:
-            return _AsyncTrt(model), f"tensorrt_{how}_async"
+            return _AsyncTrt(model, shape), f"tensorrt_{how}_async"
         except Exception as e:  # 封装失败不能影响正确性，退回同步
             print(f"[solution] 异步推理不可用（{type(e).__name__}: {e}），退回同步")
             return model.infer, f"tensorrt_{how}"
@@ -140,43 +140,126 @@ def _build_infer(onnx_path: Path, ctx: RunContext):
 class _AsyncTrt:
     """``core.trt.TrtModel`` 的异步封装：submit 只入队，finish 再取结果。
 
-    框架的循环是 ``decode → process_frame``；单帧前向（实测 ≈2.5ms）原本整段
+    框架的循环是 ``decode → process_frame``；单帧前向（实测 ≈1.6ms GPU）原本整段
     串行在 ``process_frame`` 里。拆成「本帧提交、下帧取回」后，前向与下一帧的
     NVDEC 解码重叠，``solution_sec`` 里的等待时间被解码时间吃掉。
 
-    * 输出缓冲固定复用，避免每帧 ``torch.empty``；
-    * 输入在 submit 内完成 H2D（pageable 拷贝是同步的），因此 submit 返回时
-      kernel 的数据依赖已满足；
-    * ``__call__`` 提供同步语义，warmup / 回退路径可直接当普通 infer 用。
+    单帧里真正贵的不是 GPU，而是**入队**（评测在 proot 下跑，CUDA ioctl 被 ptrace
+    拦截，TRT 逐 kernel 入队要 1.6ms；``out.cpu()`` 走 pageable 中转要 1.1ms）。
+    因此这里把整帧做成一张 CUDA Graph 一次回放：
+
+        H2D(pinned → GPU) → TRT kernel → D2H(GPU → pinned)
+
+    * 回放实测 0.144ms（对比逐帧入队 1.765ms），且 D2H 落在框架解码的空档里；
+    * 取回时 ``finish`` 只需要一次 stream 同步 + 主机端 numpy 解码，
+      解码逻辑与同步路径**完全同一份代码**，结果逐位相同（捕获后会自动校验一次，
+      校验会换一份输入再回放，确认图读的是当前 pinned 缓冲而不是捕获时的数据）；
+    * 回放统一在 ``_stream`` 上发起，``finish`` 的同步范围才覆盖得到它；
+    * 输入 / 输出 / 绑定表全部预分配，BallDetector 直接写 pinned 缓冲，
+      省掉每帧一次 5.5MB 的中间拷贝。
+
+    Graph 捕获失败（驱动不支持、引擎里有不可捕获的节点等）时自动退回逐帧入队，
+    只是慢一点，行为不变。
     """
 
-    def __init__(self, model):
+    def __init__(self, model, shape):
         self._m = model
-        self._torch = model._torch
-        self._out = self._torch.empty(model.output_shape, dtype=self._torch.float32,
-                                      device="cuda")
-        self._in = None
+        self._torch = torch = model._torch
+        self._stream = model._stream
+        self._shape = tuple(int(v) for v in shape)
+        self._out = torch.empty(model.output_shape, dtype=torch.float32, device="cuda")
+        self._in = torch.empty(self._shape, dtype=torch.float32, device="cuda")
+        self._pin = torch.empty(self._shape, dtype=torch.float32, pin_memory=True)
+        self._pin_np = self._pin.numpy()
+        self._host = torch.empty(model.output_shape, dtype=torch.float32,
+                                 pin_memory=True)
+        self._host_np = self._host.numpy()
+        self._bindings = [0] * model.engine.num_bindings
+        self._bindings[model._input_idx] = int(self._in.data_ptr())
+        self._bindings[model._output_idx] = int(self._out.data_ptr())
+        self._graph = None
         self._busy = False
 
-    def submit(self, x_np):
-        m = self._m
-        x = self._torch.from_numpy(np.ascontiguousarray(x_np)).cuda()
-        self._in = x                     # 保活到 finish（kernel 仍在读）
-        bindings = [0] * m.engine.num_bindings
-        bindings[m._input_idx] = int(x.data_ptr())
-        bindings[m._output_idx] = int(self._out.data_ptr())
-        if not m.context.execute_async_v2(bindings, m._stream.cuda_stream):
+    @property
+    def input_buffer(self):
+        """预处理可直接写入的 pinned 缓冲（BallDetector 复用它，省一次拷贝）。"""
+        return self._pin_np
+
+    def _body(self):
+        """一帧全部 GPU 操作（H2D → kernel → D2H），捕获与回放共用。"""
+        with self._torch.cuda.stream(self._stream):
+            self._in.copy_(self._pin, non_blocking=True)
+            ok = self._m.context.execute_async_v2(self._bindings,
+                                                  self._stream.cuda_stream)
+            self._host.copy_(self._out, non_blocking=True)
+        if not ok:
             raise RuntimeError("execute_async_v2 失败")
+
+    def capture(self, warm: int = 3) -> bool:
+        """把 ``_body`` 捕获成 CUDA Graph；成功返回 True，失败保持原路径。"""
+        if self._graph is not None:
+            return True
+        try:
+            for _ in range(warm):
+                self._body()
+            self._stream.synchronize()
+            ref = self._host_np.copy()          # 逐帧入队的结果，用于校验
+            graph = self._torch.cuda.CUDAGraph()
+            with self._torch.cuda.graph(graph, stream=self._stream):
+                self._body()
+            self._stream.synchronize()
+
+            def replay():
+                with self._torch.cuda.stream(self._stream):
+                    graph.replay()
+                self._stream.synchronize()
+
+            replay()
+            diff = float(np.abs(self._host_np - ref).max())
+            # 换一份输入再比一次：确认回放读的是当前 pinned 缓冲（而不是把捕获
+            # 时的输入写死在图里），顺带验证 finish 的同步确实覆盖到回放。
+            keep = self._pin_np.copy()
+            self._pin_np += 1.0
+            self._body()
+            self._stream.synchronize()
+            ref2 = self._host_np.copy()
+            replay()
+            diff2 = float(np.abs(self._host_np - ref2).max())
+            self._pin_np[...] = keep
+            self._body()
+            self._stream.synchronize()
+            if not (diff < 1e-5 and diff2 < 1e-5):
+                print(f"[solution] CUDA Graph 输出不一致（max|Δ|={diff:.3e}，"
+                      f"换输入后 {diff2:.3e}），不用它")
+                return False
+            self._graph = graph
+            return True
+        except Exception as e:
+            print(f"[solution] CUDA Graph 不可用（{type(e).__name__}: {e}），逐帧入队")
+            self._graph = None
+            return False
+
+    def submit(self, x_np):
+        if x_np is not self._pin_np and not np.shares_memory(x_np, self._pin_np):
+            np.copyto(self._pin_np, x_np)
+        # 回放必须落在 self._stream 上：``finish`` 只同步这条流。若让 replay 走
+        # 调用者的当前流（默认流），finish 会在 D2H 落地前就返回上一帧的结果——
+        # 同步路径（submit 后立刻 finish）实测会整体晚 1 帧，这里不能省。
+        with self._torch.cuda.stream(self._stream):
+            if self._graph is not None:
+                self._graph.replay()
+            else:
+                self._body()
         self._busy = True
 
     def finish(self):
-        self._m._stream.synchronize()
-        out = self._out.cpu().numpy()
-        self._in = None
+        """同步并返回完整热图（1,3,H,W）——pinned 主机内存的视图，不额外拷贝。"""
+        self._stream.synchronize()
         self._busy = False
-        return out
+        return self._host_np
 
     def __call__(self, x_np):
+        """同步语义（warmup / 回退路径）：返回完整热图，与原 TrtModel.infer 一致。"""
         self.submit(x_np)
         return self.finish()
 
@@ -200,6 +283,10 @@ class Solution(BaseSolution):
 
         # warmup：把 TRT kernel / ORT 内存池预热，避免首帧开销算进推理计时
         self.det.detect(np.zeros((IN_H, IN_W, 3), np.uint8), IN_W, IN_H)
+        # 预热后把整帧（H2D+kernel+D2H）捕获成 CUDA Graph：回放 0.14ms vs 逐帧入队 1.8ms
+        cap = getattr(infer_fn, "capture", None)
+        if callable(cap):
+            context.info["cuda_graph"] = bool(cap())
 
         context.info["backend"] = backend
         context.info["channels"] = list(self.det.channels)

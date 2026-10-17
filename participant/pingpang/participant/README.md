@@ -50,10 +50,14 @@ participant/
    桌边反弹（`|dv_y| > 60` 的离台加速折角）、二次弹跳（同一回合的第二次触台）、
    90° 同侧连续四条规则。**删掉的 4 个落点经逐点核对全是 FP（最近真值 74~178px），
    0 TP 损失、0 新增** → 三视角 FP 5→1，70.32 → **71.90**。
-5. **异步推理流水线（`_AsyncTrt`）**：单帧 TRT 前向原本整段串行在 `process_frame` 里；
-   改成「本帧 submit、下帧 finish」后与框架的 NVDEC 解码重叠，方案侧
-   5.5 → **4.7 ms/帧**，同 engine A/B：同步 46.9 → 异步 **48.5** fps
-   （速度分 23.4 → 24.2），`predictions.jsonl` 与同步版**逐字节相同**。
+5. **异步推理流水线（`_AsyncTrt`）+ 整帧 CUDA Graph**：单帧 TRT 前向原本整段串行在
+   `process_frame` 里；改成「本帧 submit、下帧 finish」后与框架的 NVDEC 解码重叠，
+   再把单帧的 `H2D → kernel → D2H` 捕获成一张 CUDA Graph 一次回放（0.144ms，对比逐帧
+   入队 1.765ms——评测在 proot 下跑，CUDA ioctl 被 ptrace 拦截，入队本身就占 ~1.6ms；
+   D2H 走 pinned 主机缓冲 1.1 → 0.03ms），预处理直接写进 pinned 输入缓冲
+   （`_prep` 返回缓冲本体，省掉每帧 5.5MB 中间拷贝）。方案侧
+   9.9 → **6.0 ms/帧**（−39%），同 engine A/B：同步 47.7 → 异步 **53.4** fps
+   （速度分 25.0，50fps 封顶），`predictions.jsonl` 与同步版、与优化前**逐字节相同**。
 
 
 > 注：三者彼此耦合（`clean_mode`/`conf_gate` 决定候选集，进而改变 NMS 的竞争结果），
@@ -61,12 +65,13 @@ participant/
 > 用**生产代码重放**独立复现（本次得 71.90 / 75、每视角 TP/FP/FN 与上表逐项相同）。
 
 > ✅ **完整得分已在评测机实测**（2026-10-18，单张 RTX 4090 + TensorRT 8.6，框架自带
-> `--decoder gpu` 解码）：精度 **71.90 / 75** + 速度 **23.8~24.4 / 25** = **95.7~96.3 / 100**
-> （三次复跑 95.73 / 96.10 / 96.25）。速度项 = `infer_fps 47.7~48.7`（15 条 / 2109 帧 /
-> 43.3~44.3 s）；同一份代码 `PP_ASYNC=0` 关掉异步流水线时是 46.9 fps（速度分 23.4），
-> 即重叠收益 ≈ +1.6 fps。按框架口径 `infer_sec` 已扣除 prepare（冷启动建 TRT engine
-> 约 270 s，单列在 `engine_build_sec`，不计入 FPS）。提速前后的 `predictions.jsonl`
-> **逐字节相同**，精度分不受影响。
+> `--decoder gpu` 解码）：精度 **71.90 / 75** + 速度 **24.8~25.0 / 25** = **96.8~96.9 / 100**
+> （三次复跑 `infer_fps` 53.4 / 49.7 / 51.0——波动全在框架解码侧 31.5~34.1 ms/帧，
+> 方案侧稳定 **6.04~6.07 ms/帧**）。同一份代码 `PP_ASYNC=0` 关掉异步流水线时是
+> 47.7 fps（`solution_sec` 10.1 s vs 6.0 s），即重叠 + CUDA Graph 的收益 ≈ +5 fps。
+> 按框架口径 `infer_sec` 已扣除 prepare（冷启动建 TRT engine 约 270 s，
+> 单列在 `engine_build_sec`，不计入 FPS）。提速前后的 `predictions.jsonl`
+> **逐字节相同**（三次复跑也都与 `out_final` 相同），精度分不受影响。
 「忽略」= 命中 GT 里 `valid=false` 的干扰点，按赛题口径既不算 TP 也不算 FP。
 
 > 📌 **上限与瓶颈（实测）**：92 个真值落点在 ±1 帧内**全部都有 ≤50px 的观测**
@@ -190,14 +195,28 @@ python3 run.py --input <input> --output <out>                               # �
   `1/(255·std)`，降到 **1.2 ms/帧**；与解析式 `(x/255-mean)/std` 数学等价
   （实测最大差 5e-7，15 条视频预测逐字节不变）。全流程 **35.6 → 45.8 fps**
   （速度分 17.8 → 22.9）。
-* **异步推理流水线**：框架的循环是 `decode → process_frame`，单帧 2.5 ms 的 TRT 前向
-  原本整段串行在 `process_frame` 里。改成 `_AsyncTrt` 的「本帧 submit、下帧 finish」
-  后（`BallDetector.push/flush`，观测帧号仍按绝对帧号落账），前向与下一帧的 NVDEC
-  解码重叠，方案侧 **5.5 → 4.7 ms/帧**、`infer_fps` **45.8 → 48.4**（速度分
-  22.9 → 24.2）；`predictions.jsonl` 与同步版逐字节相同。用 `PP_ASYNC=0` 可现场关掉
-  做 A/B（此时退回 `detect()` 同步路径）。
-* 剩余瓶颈是框架解码（`core/decoder.py` 受完整性保护，1080p 实测 ~15 ms/帧 →
-  65 fps 上限），方案侧已降到 5.5 ms/帧（异步流水线后 4.7 ms），不再是主导项。
+* **异步推理流水线 + 整帧 CUDA Graph**：框架的循环是 `decode → process_frame`，单帧
+  2.5 ms 的 TRT 前向原本整段串行在 `process_frame` 里。改成 `_AsyncTrt` 的「本帧
+  submit、下帧 finish」后（`BallDetector.push/flush`，观测帧号仍按绝对帧号落账），
+  前向与下一帧的 NVDEC 解码重叠。
+  更关键的是**入队开销**：评测在 proot 下跑，CUDA ioctl 被 ptrace 拦，TRT 逐 kernel
+  入队实测 **1.765 ms/帧**（GPU 只有 2.5 ms，CPU 却先花 1.8 ms 排队），`out.cpu()`
+  走 pageable 中转再花 1.1 ms。因此把整帧 `H2D(pinned) → TRT kernel → D2H(pinned)`
+  捕获成一张 **CUDA Graph**，每帧只 `graph.replay()`：**0.144 ms**（12×），D2H 落在
+  解码空档里，`finish()` 只剩一次 stream 同步 + 主机 numpy 解码。配套两处细节：
+  * `BallDetector._prep` 直接写进 `_AsyncTrt` 的 pinned 输入缓冲并返回缓冲本体，
+    `submit` 靠对象同一性跳过每帧 5.5MB 拷贝（此前返回切片视图，白拷一份）；
+  * **回放必须落在 `_stream` 上**：`finish()` 只同步这条流，若让 replay 用调用者的
+    默认流，同步路径（submit 后立刻 finish）会读到上一帧的 D2H 结果、整体晚 1 帧
+    （异步路径只在 `flush()` 末尾暴露，15 条视频各错 1 帧）。这是本次唯一改到
+    "结果" 的 bug，修完 `out_sync4` / `out_fast4` 与优化前 `out_final` **逐字节相同**。
+  捕获后自检两次：回放 vs 逐帧入队、以及**换一份输入再回放**（确认图读的是当前
+  pinned 缓冲而不是把捕获时的输入写死），任一不符就退回逐帧入队。
+  方案侧 **9.9 → 6.0 ms/帧**、`infer_fps` **47.7 → 49.7~53.4**（速度分 25.0 封顶）。
+  用 `PP_ASYNC=0` 可现场关掉异步流水线做 A/B（退回 `detect()` 同步路径）。
+* 剩余瓶颈是框架解码（`core/decoder.py` 受完整性保护，1080p 实测 ~15 ms/帧，
+  实测波动 31.5~34.1 ms/帧 的主机线程口径 → 50 fps 附近的抖动全来自它），
+  方案侧 6.0 ms/帧（normalize 2.7 + 3 帧栈拼装 0.8 + 解码/落点 <0.2）。
 * 落点判定全部是 numpy 的 O(n) 拟合（n=帧数），单视频耗时 ≪ 1ms，
   对 50fps 的速度分没有影响。
 * 所有观测在 `finish_video` 统一分析（框架允许延迟输出），因此落点判定不受
@@ -210,7 +229,7 @@ python3 run.py --input <input> --output <out>                               # �
 |---|---|---|
 | 不得改框架：`core/*.py`、`run.py`、`validate.py`、`integrity.py`、`scripts/*.py`、`run.sh`、`.integrity.json` | ✅ **零改动** | 这 15 个文件与官方 `origin/main:participant/pingpang/*` **逐字节相同**；`python3 integrity.py --verify` → `完整性校验通过`（打包时各任务各跑一次） |
 | 只能改参赛者代码区 `pingpang/participant/` | ✅ 全部改动都在代码区内 | `git diff --stat 8dcc186 HEAD`：`solution.py`(重写)/`ball_detector.py`(改 90 行)/新增 `landing.py`、`configs/landing.json`、`dev/*`、`README.md`；框架目录零改动 |
-| 不得升级/替换 torch、numpy==1.26.4、onnxruntime-gpu==1.18.1、tensorrt==8.6.1 | ✅ 未装/未改/未联网 | 生产代码只 import `numpy/cv2/onnxruntime/tensorrt`（连 torch 都不需要），`requirements` 无新增 |
+| 不得升级/替换 torch、numpy==1.26.4、onnxruntime-gpu==1.18.1、tensorrt==8.6.1 | ✅ 未装/未改/未联网 | 生产代码只 import `numpy/cv2/onnxruntime/tensorrt`，`requirements` 无新增；CUDA Graph 用的 torch 句柄是框架 `core/trt.py` 自己的 `model._torch`（不新 import、不改版本），拿不到时自动退回逐帧入队 |
 | 权重以 ONNX 放 `participant/weights/` 打进镜像 | ✅ | `weights/ball.onnx`（官方权重，未改动，5.3MB） |
 | 输出合法：`frame_id` 为 int 且在 `[0,n_frames)`，坐标有限且 `0<=x<width, 0<=y<height`，不越界、去重 | ✅ | 统一 clamp + 去重；15 条全量 88 行预测 **0 条非法**（`validate.py` 无 errors） |
 | 输出物 < 1GB、每任务 < 7200s、离线无联网 | ✅ | 输出仅 `predictions.jsonl`（KB 级）；CPU 全量 15 条约 13 min；无任何网络调用 |

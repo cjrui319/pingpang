@@ -47,7 +47,10 @@ class BallDetector:
         self._blank = self._normalize(np.zeros((IN_H, IN_W, 3), np.uint8))
         # 流水线：infer_fn 若带 submit/finish（异步 TRT），push/flush 走重叠路径
         self._async = hasattr(infer_fn, "submit") and hasattr(infer_fn, "finish")
-        self._inp = np.empty((1, 9, IN_H, IN_W), np.float32)
+        # 异步实现提供 pinned 输入缓冲时直接往里写，省掉每帧一次 5.5MB 拷贝
+        self._inp = getattr(infer_fn, "input_buffer", None)
+        if self._inp is None:
+            self._inp = np.empty((1, 9, IN_H, IN_W), np.float32)
         self._sx = self._sy = 1.0
         self._pending_fid = None
         self.reset()
@@ -80,18 +83,23 @@ class BallDetector:
 
     # ── 推理 + 解码 ─────────────────────────────────────────────────────────
     def _prep(self, frame_rgb: np.ndarray) -> np.ndarray:
-        """3 帧栈 → (1,9,288,512)，写入预分配缓冲（不每帧新建 5MB 数组）。"""
+        """3 帧栈 → (1,9,288,512)，写入预分配缓冲（不每帧新建 5MB 数组）。
+
+        返回缓冲本体而不是切片视图：异步后端把 ``input_buffer`` 交给这里时，
+        ``submit`` 就能靠对象同一性跳过那一份 5.5MB 的拷贝。
+        """
         self._buf.append(self._normalize(frame_rgb))
         self._buf = self._buf[-3:]
         try:
-            return np.concatenate(self._buf, axis=0, out=self._inp[0])[None]
+            np.concatenate(self._buf, axis=0, out=self._inp[0])
+            return self._inp
         except (TypeError, ValueError):          # 老 numpy 不支持 out=
             self._inp = np.concatenate(self._buf, axis=0)[None]
             return self._inp
 
     def _collect(self, fid: int) -> list[tuple[int, float, float, float]]:
         """取回一次已提交推理，解码成 (绝对帧号, x, y, conf)。"""
-        heat = self._infer.finish()[0]              # (3,288,512)
+        heat = self._infer.finish()[0]              # (3,288,512)，pinned 主机缓冲
         out: list[tuple[int, float, float, float]] = []
         for ch in self.channels:
             got = self._decode_heat(heat[ch])
@@ -144,20 +152,30 @@ class BallDetector:
         h, w = heat2d.shape
         idx = int(np.argmax(heat2d))
         py, px = divmod(idx, w)
-        peak = float(heat2d[py, px])
-        if peak < self.score_th:
-            return None
         r = self.peak_radius
         y0, y1 = max(0, py - r), min(h, py + r + 1)
         x0, x1 = max(0, px - r), min(w, px + r + 1)
-        win = heat2d[y0:y1, x0:x1]
+        return self._decode_win((y0, x0, heat2d[y0:y1, x0:x1]))
+
+    def _decode_win(self, item):
+        """``(y0, x0, 窗口)`` → (cx, cy, conf)；窗口必须包含该通道的全局峰值。
+
+        阈值判定用窗口内最大值（= 全局峰值，两者同值）；质心只统计窗口内
+        ``> score_th`` 的像素——与旧实现「整图上取 argmax 再取窗口」等价。
+        """
+        y0, x0, win = item
+        peak = float(win.max())
+        if peak < self.score_th:
+            return None
         ys, xs = np.nonzero(win > self.score_th)
-        if xs.size == 0:  # 理论上不会发生（峰本身 > 阈值）
-            return float(px), float(py), peak
+        if xs.size == 0:  # 理论上不会发生（峰本身 > 阈值）→ 退回峰值坐标
+            iy, ix = np.unravel_index(int(np.argmax(win)), win.shape)
+            return float(x0 + ix), float(y0 + iy), peak
         wgt = win[ys, xs].astype(np.float64)
         tot = float(wgt.sum())
         if tot <= 0:
-            return float(px), float(py), peak
+            iy, ix = np.unravel_index(int(np.argmax(win)), win.shape)
+            return float(x0 + ix), float(y0 + iy), peak
         cx = float(((xs + x0) * wgt).sum() / tot)
         cy = float(((ys + y0) * wgt).sum() / tot)
-        return cx, cy, float(win.max())
+        return cx, cy, peak
