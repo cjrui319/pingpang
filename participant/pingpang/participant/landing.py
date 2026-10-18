@@ -30,11 +30,10 @@ import numpy as np
 
 def fuse_obs(per_frame: dict, cluster_eps: float = 20.0
              ) -> dict[int, tuple[float, float, float]]:
-    """把同一帧的多条观测合并成一条：贪心聚类后取「数量最多」那簇（多数票）。
+    """把同一帧的多条观测合并成一条：以最高置信度为种子做邻域聚类后取均值。
 
-    之前以「最高置信度」为种子聚类，会把多通道一致的真球（弱峰）当噪声丢——
-    因为孤立干扰峰往往单通道、置信度反而更高。改成多数票：真球通常是多通道
-    一致的那簇，孤立点只有一条通道。数量平手再比置信度。
+    若模型三通道确实各对应一帧，则三条观测几乎重合 → 求平均（降噪）；
+    若只有部分通道可用，则离群观测被 ``cluster_eps`` 过滤掉。
     """
     out: dict[int, tuple[float, float, float]] = {}
     for fid, obs in per_frame.items():
@@ -43,35 +42,37 @@ def fuse_obs(per_frame: dict, cluster_eps: float = 20.0
         if len(obs) == 1:
             out[fid] = (float(obs[0][0]), float(obs[0][1]), float(obs[0][2]))
             continue
-        # 贪心聚类：按置信度降序取种子，把 eps 内的点并进同一簇。
-        remaining = sorted(obs, key=lambda o: -o[2])
-        clusters: list[tuple[float, float, float, int]] = []
-        while remaining:
-            seed = remaining.pop(0)
-            grp = [seed]
-            i = 0
-            while i < len(remaining):
-                if math.hypot(remaining[i][0] - seed[0],
-                              remaining[i][1] - seed[1]) <= cluster_eps:
-                    grp.append(remaining.pop(i))
-                else:
-                    i += 1
-            clusters.append((sum(o[0] for o in grp) / len(grp),
-                             sum(o[1] for o in grp) / len(grp),
-                             max(o[2] for o in grp), len(grp)))
-        best = max(clusters, key=lambda c: (c[3], c[2]))  # 数量优先，平手看置信度
-        out[fid] = (float(best[0]), float(best[1]), float(best[2]))
+        seed = max(obs, key=lambda o: o[2])
+        grp = [o for o in obs
+               if math.hypot(o[0] - seed[0], o[1] - seed[1]) <= cluster_eps]
+        xs = [o[0] for o in grp]
+        ys = [o[1] for o in grp]
+        cs = [o[2] for o in grp]
+        out[fid] = (float(sum(xs) / len(xs)), float(sum(ys) / len(ys)),
+                    float(max(cs)))
     return out
 
 
 def clean_track(points: list[tuple[float, float, float, float]],
                 max_resid: float = 30.0, max_gap: int = 6,
-                rounds: int = 2) -> list[tuple[float, float, float, float]]:
-    """剔除离群点：与前后邻点线性插值的偏差超过 ``max_resid`` 且置信度不高者丢弃。
+                rounds: int = 2, mode: str = "chord"
+                ) -> list[tuple[float, float, float, float]]:
+    """剔除离群点。
 
-    ``points`` 必须是按帧号升序的 ``(f, x, y, conf)`` 列表。迭代 ``rounds`` 轮，
-    这样"成对出现"的离群点也能被清理掉（单轮只看 i-1/i+1 时会互相掩护）。
+    ``mode="chord"``（默认，历史行为）：与**前后邻点线性插值**的偏差超过
+    ``max_resid`` 且置信度不高者丢弃。``points`` 必须是按帧号升序的
+    ``(f, x, y, conf)`` 列表。迭代 ``rounds`` 轮，这样"成对出现"的离群点也能被
+    清理掉（单轮只看 i-1/i+1 时会互相掩护）。
+
+    ``mode="side"``（折角感知）：点只要贴合**前侧两点**或**后侧两点**的直线外推
+    就保留。动机：触台帧本身天然偏离前后插值弦（球心速度在此反向），
+    conf 又常因运动模糊掉到 0.9 以下，于是"弦判据"会把**真落点**当离群点删掉
+    （实测 v000085 的 f128：与真值仅差 18px、Δv_y=-181px/帧，却因 conf=0.89
+    被删，直接丢一个 TP）。而触台顶点必然贴合前侧外推（触台前轨迹光滑）、
+    反跳后的点则贴合后侧外推，两侧都不贴合的才是真离群点。
     """
+    if mode == "side":
+        return _clean_track_side(points, max_resid, max_gap, rounds)
     pts = list(points)
     for _ in range(max(1, rounds)):
         if len(pts) < 3:
@@ -100,6 +101,43 @@ def clean_track(points: list[tuple[float, float, float, float]],
     return pts
 
 
+def _clean_track_side(points: list[tuple[float, float, float, float]],
+                      max_resid: float, max_gap: int, rounds: int
+                      ) -> list[tuple[float, float, float, float]]:
+    """``clean_track(mode="side")`` 的实现：贴合前侧或后侧直线外推即保留。"""
+    pts = list(points)
+    for _ in range(max(1, rounds)):
+        if len(pts) < 3:
+            break
+        n = len(pts)
+        keep: list[tuple[float, float, float, float]] = []
+        for i in range(n):
+            if i == 0 or i == n - 1:
+                keep.append(pts[i])
+                continue
+            f, x, y, c = pts[i]
+            ok = False
+            for a, b in ((i - 2, i - 1), (i + 1, i + 2)):
+                if a < 0 or b >= n:
+                    continue
+                fa, xa, ya, _ = pts[a]
+                fb, xb, yb, _ = pts[b]
+                if (fb - fa) <= 0 or (fb - fa) > 2 * max_gap:
+                    continue
+                t = (f - fa) / (fb - fa)
+                ex = xa + t * (xb - xa)
+                ey = ya + t * (yb - ya)
+                if math.hypot(x - ex, y - ey) <= max_resid:
+                    ok = True
+                    break
+            if ok or c >= 0.9:
+                keep.append(pts[i])
+        if len(keep) == len(pts):
+            break
+        pts = keep
+    return pts
+
+
 def _line_slope(F: np.ndarray, V: np.ndarray, idx: np.ndarray, f0: float) -> float:
     """对 ``idx`` 选中的点拟合 ``V = p·(F - f0) + q``，返回斜率 p。"""
     t = F[idx] - f0
@@ -112,8 +150,9 @@ def _line_slope(F: np.ndarray, V: np.ndarray, idx: np.ndarray, f0: float) -> flo
 
 def kink_candidates(points: list[tuple[float, float, float, float]],
                     k: int = 2, span: float = 6.0, max_step: float = 2.0
-                    ) -> list[tuple[float, float, float, float, float, float]]:
-    """逐帧计算"折角"原始信号，返回 ``[(f, x, y, Δv_y, Δv_x, conf), ...]``。
+                    ) -> list[tuple[float, ...]]:
+    """逐帧计算"折角"原始信号，返回
+    ``[(f, x, y, Δv_y, Δv_x, conf, v_y前, v_y后, dt前, dt后), ...]``。
 
     每个候选帧用**前后各 k 个点**分别线性拟合 x/y，得到触台前后两个速度矢量，
     ``Δv = v_后 - v_前``。真触台的 ``Δv_y`` 是负尖峰；``Δv_x`` 用于方向一致性过滤。
@@ -121,6 +160,10 @@ def kink_candidates(points: list[tuple[float, float, float, float]],
 
     ``max_step``：紧邻的前后观测必须在这么多帧内。轨迹断口（丢检/末端野点）会
     制造出 ±100px/帧² 量级的伪折角——实测这类伪折角是 FP 的主要来源之一。
+
+    后四项（``v_y前 / v_y后 / dt前 / dt后``）供 ``pick_landings`` 的物理门控使用：
+    真触台必须"触台前在下落（``v_y前 > 0``）、触台后在抬升（``v_y后 < 0``）"，
+    且紧邻观测不能跨断口——三者合起来能把大量"-16px 量级的弱伪折角"判掉。
     """
     n = len(points)
     if n < 3:
@@ -130,7 +173,7 @@ def kink_candidates(points: list[tuple[float, float, float, float]],
     Y = np.array([p[2] for p in points], dtype=np.float64)
     C = np.array([p[3] for p in points], dtype=np.float64)
 
-    out: list[tuple[float, float, float, float, float, float]] = []
+    out: list[tuple[float, ...]] = []
     for i in range(n):
         left = np.where((F < F[i]) & (F >= F[i] - span))[0][-k:]
         right = np.where((F > F[i]) & (F <= F[i] + span))[0][:k]
@@ -138,13 +181,17 @@ def kink_candidates(points: list[tuple[float, float, float, float]],
             continue                      # 两侧都要有观测量出前后速度
         if (F[i] - F[left[-1]] > max_step) or (F[right[0]] - F[i] > max_step):
             continue                      # 紧邻观测太远 → 断口，不可信
-        dvy = _line_slope(F, Y, right, F[i]) - _line_slope(F, Y, left, F[i])
+        vy_before = _line_slope(F, Y, left, F[i])
+        vy_after = _line_slope(F, Y, right, F[i])
+        dvy = vy_after - vy_before
         dvx = _line_slope(F, X, right, F[i]) - _line_slope(F, X, left, F[i])
-        out.append((float(F[i]), float(X[i]), float(Y[i]), dvy, dvx, float(C[i])))
+        out.append((float(F[i]), float(X[i]), float(Y[i]), dvy, dvx, float(C[i]),
+                    vy_before, vy_after, float(F[i] - F[left[-1]]),
+                    float(F[right[0]] - F[i])))
     return out
 
 
-def _nms_key(c: tuple[float, float, float, float, float, float], nms: str) -> float:
+def _nms_key(c: tuple[float, ...], nms: str) -> float:
     """NMS 排序键：**键越小越优先**。"""
     if nms == "dv":
         return c[3] * c[5]                    # 折角最猛者优先（等价 -(-Δv_y·conf)）
@@ -156,12 +203,14 @@ def _nms_key(c: tuple[float, float, float, float, float, float], nms: str) -> fl
     return -c[2]                              # maxy：最低点优先（历史行为）
 
 
-def pick_landings(cands: list[tuple[float, float, float, float, float, float]],
+def pick_landings(cands: list[tuple[float, ...]],
                   dv_y: float = -10.0, max_dvx_ratio: float = 0.5,
                   min_gap: float = 6.0, nms: str = "maxy",
-                  dv_strong: float = 0.0, ratio_strong: float = 0.0
+                  dv_strong: float = 0.0, ratio_strong: float = 0.0,
+                  vb_min: float | None = None, va_max: float | None = None,
+                  dt_max: float | None = None, conf_min: float | None = None
                   ) -> list[tuple[int, float, float, float]]:
-    """从折角信号里挑出落点（阈值 + 方向一致 + NMS）。
+    """从折角信号里挑出落点（阈值 + 方向一致 + 物理门控 + NMS）。
 
     ``dv_strong``/``ratio_strong``：强折角的宽松档。侧旋或斜视角下真触台的
     水平速度也可能明显变化（实测 45 度有真落点 ``|Δv_x|/|Δv_y|`` 高达 0.65~0.92
@@ -171,6 +220,15 @@ def pick_landings(cands: list[tuple[float, float, float, float, float, float]],
 
     ``nms``：``maxy`` 最低点优先 / ``dv`` 折角最猛者优先 / ``combo`` 折角强度×
     方向一致性优先。
+
+    物理门控（``None`` = 关闭，缺省与历史行为一致），全部作用在折角候选的
+    ``v_y前 / v_y后 / dt前 / dt后 / conf`` 上：
+
+    * ``vb_min``：要求触台**前**的 y 速度 ``>= vb_min``（球在下落/更严格地取 0）。
+      文献上"触台前必下落"，实测能把"球还在上升时的伪折角"判掉。
+    * ``va_max``：要求触台**后**的 y 速度 ``<= va_max``（球必须开始抬升）。
+    * ``dt_max``：紧邻观测帧距上限（与 ``max_step`` 同义但可单独收紧）。
+    * ``conf_min``：候选点置信度下限。
     """
     strong = dv_strong > 0.0
     keep = []
@@ -181,6 +239,15 @@ def pick_landings(cands: list[tuple[float, float, float, float, float, float]],
             keep.append(c)
         elif strong and abs(c[3]) >= dv_strong and abs(c[4]) <= ratio_strong * abs(c[3]):
             keep.append(c)
+    if conf_min is not None:
+        keep = [c for c in keep if c[5] >= conf_min]
+    if len(cands) and len(cands[0]) >= 7:      # 带物理门控字段的候选
+        if vb_min is not None:
+            keep = [c for c in keep if c[6] >= vb_min]
+        if va_max is not None:
+            keep = [c for c in keep if c[7] <= va_max]
+        if dt_max is not None:
+            keep = [c for c in keep if c[8] <= dt_max and c[9] <= dt_max]
     ordered = sorted(keep, key=lambda c: _nms_key(c, nms))
     picked: list[tuple[int, float, float, float]] = []
     for c in ordered:
@@ -238,15 +305,26 @@ def find_landings(points: list[tuple[float, float, float, float]], cfg: dict
     * ``min_gap``        两个落点之间的最小帧间隔（NMS，默认 6）
     * ``nms``            重叠候选保留谁：``maxy`` 最低点 / ``dv`` 折角最猛者 /
                          ``combo`` 折角强度×方向一致性
+    * ``vb_min``         触台前 y 速度下限（``None`` = 关）：真触台前球必须在下落
+    * ``va_max``         触台后 y 速度上限（``None`` = 关）：真触台后球必须开始抬升
+    * ``dt_max``         紧邻观测帧距上限（``None`` = 关），比 ``max_step`` 更严的断口门
+    * ``conf_min``       候选点置信度下限（``None`` = 关）
     """
     cands = kink_candidates(points, int(cfg.get("k", 2)), float(cfg.get("span", 6)),
                             float(cfg.get("max_step", 2.0)))
+
+    def _opt(name):
+        v = cfg.get(name, None)
+        return None if v is None else float(v)
+
     return pick_landings(cands, float(cfg.get("dv_y", -10.0)),
                          float(cfg.get("max_dvx_ratio", 0.5)),
                          float(cfg.get("min_gap", 6)),
                          str(cfg.get("nms", "maxy")),
                          float(cfg.get("dv_strong", 0.0)),
-                         float(cfg.get("ratio_strong", 0.0)))
+                         float(cfg.get("ratio_strong", 0.0)),
+                         _opt("vb_min"), _opt("va_max"), _opt("dt_max"),
+                         _opt("conf_min"))
 
 
 def _depart_slope(points: list[tuple[float, float, float, float]],

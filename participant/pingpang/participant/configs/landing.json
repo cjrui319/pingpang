@@ -1,9 +1,13 @@
 {
-  "_comment": "乒乓球落点检测参数。detector = 球检测与观测融合；landing 按视角(0/45/90度)分档，缺字段用 landing.default。landing 段为速度折角 + ROI台面门控 + combo NMS + 强折角档（toshi 分支 68.35/75 版本）。",
+  "_comment": "乒乓球落点检测参数。detector = 球检测与观测融合；landing 按视角(0/45/90度)分档，缺字段用 landing.default。用 participant/dev/tune.py 在公开验证集上网格搜索得到。",
   "detector": {
     "score_th": 0.55,
-    "conf_gate": 0.6,
-    "channels": [0, 1, 2],
+    "conf_gate": 0.5,
+    "channels": [
+      0,
+      1,
+      2
+    ],
     "peak_radius": 14
   },
   "landing": {
@@ -17,45 +21,57 @@
       "max_step": 1.0,
       "max_resid": 30.0,
       "max_gap": 6,
+      "clean_mode": "chord",
       "roi_min_keep": 0.5,
-      "_roi_note": "roi = 球台投影区(归一化 x0,y0,x1,y1)，落点落在区外直接丢弃——台外的折角是球离台后在地面/挡板上的真实反弹，Δv_y 与台内触台无法区分。取值=该视角全部真值落点包围盒外扩：0/45度 50px、90度 100px。roi_min_keep 是 fail-open 阈值：过滤后剩余落点不足该比例时说明机位不符，整体放弃过滤。"
+      "_gate_note": "物理门控（可选，缺省=关）：vb_min=触台前 y 速度下限（真触台前球必须在下落）、va_max=触台后 y 速度上限（真触台后球必须开始抬升）、dt_max=紧邻观测帧距上限（比 max_step 更严的断口门）、conf_min=候选点置信度下限。clean_mode: chord=与前后邻点的插值弦比残差（历史行为）；side=只要贴合前侧或后侧两点直线外推就保留——触台顶点天然偏离插值弦且常因运动模糊掉到 conf<0.9，cord 判据会把真落点当离群点删掉（实测直接丢 TP）。",
+      "_roi_note": "roi = 球台投影区(归一化 x0,y0,x1,y1)，落点落在区外直接丢弃——台外的折角是球离台后在地面/挡板上的真实反弹，Δv_y 与台内触台无法区分。取值=该视角全部真值落点包围盒外扩：0/45度 50px、90度 100px（90度侧视把台面纵深压缩得很窄，需要更大外扩）。roi_min_keep 是 fail-open 阈值：过滤后剩余落点不足该比例时说明机位不符，整体放弃过滤。"
     },
     "0度": {
-      "dv_y": -10.0,
-      "max_dvx_ratio": 0.5,
-      "min_gap": 5.0,
-      "nms": "maxy",
+      "clean_mode": "chord",
+      "max_resid": 45.0,
+      "max_gap": 10,
       "k": 2,
-      "span": 4.0,
+      "span": 6.0,
       "max_step": 1.0,
-      "max_resid": 30.0,
-      "max_gap": 6,
+      "dv_y": -10.0,
+      "max_dvx_ratio": 0.3,
+      "min_gap": 6.0,
+      "dv_strong": 25.0,
+      "ratio_strong": 0.6,
+      "nms": "maxy",
+      "va_max": 30.0,
+      "conf_min": 0.7,
+      "dt_max": 1.0,
       "roi": [0.4222, 0.274, 0.6014, 0.6429]
     },
     "45度": {
-      "dv_y": -16.0,
-      "max_dvx_ratio": 0.5,
-      "min_gap": 5.0,
-      "nms": "maxy",
+      "clean_mode": "side",
+      "max_resid": 20.0,
+      "max_gap": 6,
       "k": 2,
       "span": 4.0,
       "max_step": 1.0,
-      "max_resid": 30.0,
-      "max_gap": 6,
-      "roi": [0.2731, 0.3453, 0.7277, 0.617],
+      "dv_y": -12.0,
+      "max_dvx_ratio": 0.5,
+      "min_gap": 6.0,
+      "nms": "maxy",
       "dv_strong": 25.0,
-      "ratio_strong": 0.7
+      "ratio_strong": 0.7,
+      "vb_min": 0.0,
+      "va_max": 20.0,
+      "roi": [0.2731, 0.3453, 0.7277, 0.617]
     },
     "90度": {
+      "clean_mode": "chord",
+      "max_resid": 30.0,
+      "max_gap": 6,
+      "k": 2,
+      "span": 4.0,
+      "max_step": 1.0,
       "dv_y": -12.0,
       "max_dvx_ratio": 1.0,
       "min_gap": 6.0,
       "nms": "combo",
-      "k": 2,
-      "span": 4.0,
-      "max_step": 1.0,
-      "max_resid": 30.0,
-      "max_gap": 6,
       "roi": [0.3417, 0.3246, 0.669, 0.7528]
     }
   }

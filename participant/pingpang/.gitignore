@@ -3,3 +3,6 @@ __pycache__/
 *.egg-info/
 user/models/trt_cache/
 out_check_solution/
+
+# 本地评测用的原片不进仓库（public_data 只跟踪 manifest / gt）
+public_data/videos/**/*.mp4
